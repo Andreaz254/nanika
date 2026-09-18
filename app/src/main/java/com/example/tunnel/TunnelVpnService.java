@@ -21,7 +21,10 @@ import com.example.tunnel.engine.PacketEngine;
 import com.example.tunnel.engine.PacketSink;
 import com.example.tunnel.engine.UpstreamListener;
 import com.example.tunnel.engine.UpstreamStream;
-import com.example.tunnel.vless.VlessCodec;
+import com.example.tunnel.engine.UpstreamConnector;
+import com.example.tunnel.protocol.ProtocolConfig;
+import com.example.tunnel.protocol.ProtocolRegistry;
+import com.example.tunnel.protocol.TunnelProtocol;
 
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
@@ -130,24 +133,28 @@ public class TunnelVpnService extends android.net.VpnService {
 
     private void connect(Cfg cfg) {
         try {
-            if ("VMess".equalsIgnoreCase(cfg.protocol)) {
-                throw new IOException("VMess is not implemented in this build. The current connector and packet engine use VLESS; choose VLESS or add a VMess protocol connector before connecting.");
-            }
+            TunnelProtocol proto = ProtocolRegistry.require(cfg.protocol);
+            if (proto.unavailableReason() != null) throw new IOException(proto.unavailableReason());
             TunnelState.set(TunnelState.State.CONNECTING, "Connecting");
             TunnelState.log("Connect IP " + cfg.connectIp + ", SNI " + cfg.sni + ", Host " + cfg.hostHeader
                     + ", path " + cfg.path + (cfg.insecureTls ? "  [TLS verification OFF]" : ""));
 
-            byte[] uuid = VlessCodec.parseUuid(cfg.uuid);
-            String path = cfg.path.startsWith("/") ? cfg.path : "/" + cfg.path;
-            String urlHost = cfg.tls ? cfg.sni : cfg.hostHeader;
-            String scheme = cfg.tls ? "https://" : "http://";
-            String url = scheme + urlHost + ":" + cfg.port + path;
-            
+            ProtocolConfig pc = new ProtocolConfig();
+            pc.uuid = cfg.uuid;
+            pc.hostHeader = cfg.hostHeader;
+            pc.sni = cfg.sni;
+            pc.path = cfg.path;
+            pc.connectIp = cfg.connectIp;
+            pc.dns = cfg.dns;
+            pc.port = cfg.port;
+            pc.tls = cfg.tls;
+            pc.insecureTls = cfg.insecureTls;
+
+            TunnelState.log("Protocol: " + proto.id());
             TunnelState.log("Transport: " + (cfg.tls ? "TLS (WSS)" : "Non-TLS (WS)"));
 
-
             OkHttpClient c = buildClient(cfg);
-            VlessWsConnector connector = new VlessWsConnector(c, url, cfg.hostHeader, uuid);
+            UpstreamConnector connector = proto.createConnector(c, pc);
             synchronized (lock) {
                 if (!active.get()) return;
                 client = c;
@@ -194,7 +201,7 @@ public class TunnelVpnService extends android.net.VpnService {
     }
 
     /** Opens one tunnelled TCP connection to the DNS server and waits for a real answer. */
-    private void preflight(VlessWsConnector connector, String dns) throws IOException, InterruptedException {
+    private void preflight(UpstreamConnector connector, String dns) throws IOException, InterruptedException {
         final CountDownLatch done = new CountDownLatch(1);
         final AtomicReference<String> failure = new AtomicReference<String>();
         final byte[][] rx = {new byte[512]};

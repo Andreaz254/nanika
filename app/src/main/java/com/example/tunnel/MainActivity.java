@@ -29,7 +29,8 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 
-import com.example.tunnel.vless.VlessCodec;
+import com.example.tunnel.protocol.ProtocolConfig;
+import com.example.tunnel.protocol.ProtocolRegistry;
 
 public class MainActivity extends AppCompatActivity
         implements TunnelState.Listener {
@@ -751,11 +752,13 @@ public class MainActivity extends AppCompatActivity
     }
 
     private String validate() {
+        ProtocolConfig pc = new ProtocolConfig();
+        pc.uuid = editUuid.getText().toString();
         try {
-            VlessCodec.parseUuid(
-                    editUuid.getText().toString());
-        } catch (IllegalArgumentException e) {
-            return "UUID: " + e.getMessage();
+            String protoErr = ProtocolRegistry.require(selectedProtocol).validate(pc);
+            if (protoErr != null) return protoErr;
+        } catch (java.io.IOException e) {
+            return e.getMessage();
         }
 
         try {
