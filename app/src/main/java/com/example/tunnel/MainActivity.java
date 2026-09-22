@@ -376,7 +376,7 @@ public class MainActivity extends AppCompatActivity
         updateProtocolFieldHints();
         addText("Settings are remembered separately for VLESS and VMess on this device.");
         if ("VMess".equals(selectedProtocol)) {
-            addText("VMess configuration form selected. VMess transport support is not yet implemented in the current tunnel engine.");
+            addText("VMess (AEAD, alterId 0, auto/AES-128-GCM) over WebSocket. Make sure the phone clock is accurate: the server rejects requests more than 2 minutes off.");
         }
 
         screen.addView(editUuid);
