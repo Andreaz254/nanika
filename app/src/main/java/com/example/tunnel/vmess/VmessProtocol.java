@@ -4,23 +4,20 @@ import com.example.tunnel.engine.UpstreamConnector;
 import com.example.tunnel.protocol.ProtocolConfig;
 import com.example.tunnel.protocol.TunnelProtocol;
 import com.example.tunnel.protocol.Uuids;
+import com.example.tunnel.protocol.WsUrl;
 
 import java.io.IOException;
 
 import okhttp3.OkHttpClient;
 
 /**
- * VMess slot. Form validation works; the wire protocol is NOT implemented yet, so selecting it
- * reports a clear error instead of sending garbage to the server (VLESS is untouched either way).
- * See ARCHITECTURE.md for the two ways to fill it in.
+ * VMess over WebSocket (AEAD header, alterId 0, AES-128-GCM body, "auto" security as in v2rayNG).
+ * Wire logic: VmessCodec + VmessWsConnector. VLESS is untouched.
  */
 public final class VmessProtocol implements TunnelProtocol {
     @Override public String id() { return "VMess"; }
 
-    @Override public String unavailableReason() {
-        return "VMess is not implemented in this build. Choose VLESS, or add a VMess connector "
-                + "(see ARCHITECTURE.md) before connecting.";
-    }
+    @Override public String unavailableReason() { return null; }
 
     @Override public String validate(ProtocolConfig cfg) {
         try {
@@ -32,6 +29,7 @@ public final class VmessProtocol implements TunnelProtocol {
     }
 
     @Override public UpstreamConnector createConnector(OkHttpClient client, ProtocolConfig cfg) throws IOException {
-        throw new IOException(unavailableReason());
+        byte[] uuid = Uuids.parse(cfg.uuid);
+        return new VmessWsConnector(client, WsUrl.build(cfg), cfg.hostHeader, uuid);
     }
 }
