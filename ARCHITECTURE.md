@@ -7,7 +7,9 @@
 | `vless/VlessCodec.java` | **VLESS only** | 26-byte request header, response-header stripping (unchanged) |
 | `vless/VlessWsConnector.java` | **VLESS only** | One OkHttp WebSocket per TCP flow (moved here, code unchanged) |
 | `vless/VlessProtocol.java` | **VLESS only** | Plugs VLESS into the registry (validate + build connector) |
-| `vmess/VmessProtocol.java` | **VMess only** | Registry slot. Validates the UUID; reports "not implemented" on connect |
+| `vmess/VmessCodec.java` | **VMess only** | AEAD header (KDF, auth ID, AES-GCM), AES-128-GCM chunk framing, streaming response decoder. Pure JCA |
+| `vmess/VmessWsConnector.java` | **VMess only** | One OkHttp WebSocket per TCP flow (same shape as the VLESS connector) |
+| `vmess/VmessProtocol.java` | **VMess only** | Plugs VMess into the registry (validate + build connector) |
 | `protocol/TunnelProtocol.java` | shared | Interface every protocol implements |
 | `protocol/ProtocolRegistry.java` | shared | The one list of protocols (add new ones here) |
 | `protocol/ProtocolConfig.java` | shared | Neutral form data handed to a protocol |
@@ -39,27 +41,29 @@ inline code for TLS and non-TLS. The only visible change is one extra log line, 
 | IPv6 | Supported | Blocked on purpose |
 | Adding a protocol | Add a link parser + outbound builder; the core does the rest | Write the full wire protocol yourself |
 
-## 3. Which core, and how VMess should be done
+## 3. VMess: how it is done here, and how that relates to v2rayNG
 
-**Use Xray-core** (via AndroidLibXrayLite, the same AAR route v2rayNG uses). It handles both VLESS and VMess.
-To my knowledge V2Fly's core does not support VLESS, so it cannot be your single core. Verify this before relying on it.
+v2rayNG has no VMess code of its own: `CoreOutboundBuilder.toOutboundVmess` emits a config
+(`protocol: vmess`, user id, `security` default **"auto"**, alterId 0, ws + tls streamSettings) and the Xray core does the wire
+protocol. The `AndroidLibXrayLite` folder in the uploaded zip is empty (a git submodule), so Xray's source was not available to copy.
+`vmess/VmessCodec` therefore implements the Xray-core VMess **AEAD** client spec directly in Java, with v2rayNG's settings:
 
-I did **not** implement VMess, deliberately:
-* "Exactly like v2rayNG" means embedding the Go core. That needs the AAR (build with gomobile or take it from a
-  v2rayNG release) and a Gradle sync; this sandbox has no network and no Android SDK, so I cannot build or test it.
-* A pure-Java VMess (AEAD header + AES-GCM/ChaCha20 body) is possible but I have no VMess server here to test
-  against, and I won't hand you untested crypto framing and call it guaranteed.
+| Item | v2rayNG / Xray | This app |
+|---|---|---|
+| alterId | 0 (AEAD header) | 0 |
+| security "auto" | AES-128-GCM on arm64/amd64, else ChaCha20-Poly1305 | AES-128-GCM always |
+| Header | authID + AEAD(len) + nonce + AEAD(header), nested-HMAC KDF | same |
+| Body | chunks; Xray also enables chunk masking, global padding, authenticated length | chunk stream only (option S); plain 2-byte length. Valid for any server |
+| Transport | ws (+tls) | ws (+tls), reuses `WsUrl` and the VLESS client settings |
+| Address | domain or IP | IPv4 (the engine only has IPs), same as the VLESS path |
 
-Recommended path, which cannot break VLESS:
-1. Keep VLESS on the current engine (untouched).
-2. Add the Xray AAR. In `VmessProtocol`, instead of a connector, generate a core config and start the core on the
-   TUN fd, the way v2rayNG's `CoreConfigManager` / `CoreServiceManager` do. Outbound shape:
-   `{"protocol":"vmess","settings":{"vnext":[{"address":CONNECT_IP,"port":PORT,"users":[{"id":UUID,"alterId":0,"security":"auto"}]}]},
-   "streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":SNI},"wsSettings":{"path":PATH,"headers":{"Host":HOST}}}}`
-3. Because this path hands the TUN to the core, `TunnelProtocol` would need a second kind of backend (core-based
-   instead of connector-based). I left that out until the AAR exists so nothing half-built ships in your APK.
+Limits: TCP + DNS only (as VLESS), no mux, no ChaCha20 (JCA ChaCha20-Poly1305 needs API 28, minSdk is 21).
+The server rejects clients whose clock is more than ~2 minutes off, so a wrong phone clock looks like a dead server.
 
-## 4. Not verified
+## 4. Verified / not verified
+VMess: `sh tools/vmess/run_vmess_tests.sh`. The Java codec is cross-checked against an independent Python implementation (header, KDF, chunks, response), and the real connector is run against a fake VMess server. **Not tested against a real Xray/V2Ray server or on a device.**
+
+### Still not verified
 Gradle/Android build, and any on-device run. I type-checked the pure-Java packages with stubs and ran the tests
 above; the Android classes (service, activity) were edited but not compiled here. Please run `./gradlew assembleDebug`
 and confirm VLESS still shows "Tunnel check OK" before relying on it.
