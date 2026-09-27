@@ -1,5 +1,6 @@
 package com.example.tunnel.protocol;
 
+import com.example.tunnel.ssh.SshProtocol;
 import com.example.tunnel.vless.VlessProtocol;
 import com.example.tunnel.vmess.VmessProtocol;
 
@@ -14,6 +15,7 @@ public final class ProtocolRegistry {
     static {
         register(new VlessProtocol());
         register(new VmessProtocol());
+        register(new SshProtocol());
         // register(new TrojanProtocol());   <- add new protocols here
     }
 
