@@ -7,7 +7,10 @@ set -e
 cd "$(dirname "$0")/../.."
 OUT=$(mktemp -d)
 JAVAC="javac"; command -v javac >/dev/null 2>&1 || JAVAC="java -m jdk.compiler/com.sun.tools.javac.Main"
-$JAVAC -source 8 -target 8 -Xlint:-options -d "$OUT/engine" app/src/main/java/com/example/tunnel/engine/*.java app/src/main/java/com/example/tunnel/vless/*.java
+# VlessWsConnector needs OkHttp / TunnelState: compiled against the tiny stubs from tools/vmess/stubs
+$JAVAC -source 8 -target 8 -Xlint:-options -d "$OUT/engine" tools/vmess/stubs/okio/*.java tools/vmess/stubs/okhttp3/*.java \
+  tools/vmess/stubs/com/example/tunnel/TunnelState.java app/src/main/java/com/example/tunnel/engine/*.java \
+  app/src/main/java/com/example/tunnel/vless/VlessCodec.java app/src/main/java/com/example/tunnel/vless/VlessWsConnector.java
 $JAVAC -source 8 -target 8 -Xlint:-options -cp "$OUT/engine" -d "$OUT/tests" tools/e2e/E2EHarness.java tools/e2e/VlessTest.java
 echo "== VLESS framing =="; java -cp "$OUT/engine:$OUT/tests" VlessTest
 echo "== TCP/DNS engine vs. the real kernel TCP stack (TUN) =="; python3 tools/e2e/e2e_test.py "$OUT/engine" "$OUT/tests"
