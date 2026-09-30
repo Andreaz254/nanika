@@ -3,35 +3,28 @@ package com.example.tunnel.ssh;
 import com.example.tunnel.engine.UpstreamConnector;
 import com.example.tunnel.protocol.ProtocolConfig;
 import com.example.tunnel.protocol.TunnelProtocol;
-
 import java.io.IOException;
-
 import okhttp3.OkHttpClient;
 
-/**
- * SSH over WebSocket / HTTP-upgrade payload, with SNI (TLS, proxy port 443) or without (plain, proxy port 80).
- * One SSH session; every tunnelled TCP connection is an SSH direct-tcpip channel. VLESS / VMess are untouched.
- */
+/** SSH over a raw byte stream established by an HTTP/WebSocket-style payload handshake. */
 public final class SshProtocol implements TunnelProtocol {
     @Override public String id() { return "SSH"; }
-
     @Override public String unavailableReason() { return null; }
-
-    @Override public String validate(ProtocolConfig cfg) {
-        if (isBlank(cfg.sshUser)) return "SSH username is empty (menu > Configure SSH)";
-        if (isBlank(cfg.sshPassword)) return "SSH password is empty (menu > Configure SSH)";
-        if (cfg.sshPort < 1 || cfg.sshPort > 65535) return "SSH port must be 1-65535 (menu > Configure SSH)";
-        if (isBlank(cfg.proxyHost)) return "Proxy host is empty (menu > Payload)";
-        if (cfg.proxyPort < 1 || cfg.proxyPort > 65535) return "Proxy port must be 1-65535 (menu > Payload)";
-        if (cfg.tls && isBlank(cfg.sni)) return "SNI host is empty";
+    @Override public String validate(ProtocolConfig c) {
+        if (blank(c.sshUsername)) return "Configure SSH: username is required";
+        if (blank(c.sshPassword)) return "Configure SSH: password is required";
+        if (blank(c.hostHeader)) return "Proxy host is required";
+        if (c.port < 1 || c.port > 65535) return "Proxy port must be 1-65535";
+        if (c.tls && blank(c.sni)) return "SNI host is required for TLS";
         return null;
     }
-
-    @Override public UpstreamConnector createConnector(OkHttpClient client, ProtocolConfig cfg) throws IOException {
-        String err = validate(cfg);
-        if (err != null) throw new IOException(err);
-        return new SshConnector(cfg);
+    private static boolean blank(String s) { return s == null || s.trim().isEmpty(); }
+    @Override public UpstreamConnector createConnector(OkHttpClient ignored, ProtocolConfig c) throws IOException {
+        // "Server" = the SSH/WebSocket target (goes into Host: via [host]).
+        // "Connect IP" = where the TCP socket really goes (the proxy / bug host, e.g. betika.com). Falls back to Server.
+        String target = c.hostHeader;
+        String proxy = blank(c.connectIp) ? target : c.connectIp.trim();
+        return new SshWsConnector(blank(c.sshHost) ? target : c.sshHost,
+                c.sshUsername, c.sshPassword, proxy, target, c.port, c.sni, c.tls, c.insecureTls, c.payload, c.path);
     }
-
-    private static boolean isBlank(String s) { return s == null || s.trim().isEmpty(); }
 }
