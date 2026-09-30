@@ -20,8 +20,6 @@ public final class TunnelState {
 
     private static volatile State state = State.DISCONNECTED;
     private static volatile String message = "";
-    private static volatile long connectedAt;
-    private static final java.text.SimpleDateFormat CLOCK = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US);
     private static Listener listener;
 
     private TunnelState() {}
@@ -38,13 +36,7 @@ public final class TunnelState {
 
     public static synchronized void setListener(Listener l) { listener = l; }
 
-    /** Wall-clock time the current CONNECTED period began (0 if not connected). */
-    public static long connectedAt() { return state == State.CONNECTED ? connectedAt : 0; }
-
-    public static synchronized void clearLog() { LOG.clear(); }
-
     public static void set(final State s, final String msg) {
-        if (s == State.CONNECTED && state != State.CONNECTED) connectedAt = System.currentTimeMillis();
         state = s;
         message = msg == null ? "" : msg;
         final Listener l;
@@ -55,10 +47,9 @@ public final class TunnelState {
     }
 
     public static void log(String msg) {
+        final String line = "[*] " + msg;
         final Listener l;
-        final String line;
         synchronized (TunnelState.class) {
-            line = "[" + CLOCK.format(new java.util.Date()) + "] " + msg;
             LOG.addLast(line);
             while (LOG.size() > MAX_LINES) LOG.removeFirst();
             l = listener;
