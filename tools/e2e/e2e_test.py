@@ -105,13 +105,9 @@ def dns_server():
 dns_stats = dns_server()
 
 # ---------------------------------------------------------------- start the engine and bridge it to the TUN
-# E2E_HARNESS_CLASS / E2E_HARNESS_ARGS / E2E_CLASSPATH_EXTRA let tools/ssh/run_ssh_engine_e2e.sh run the same checks
-# with a different upstream connector (default: the plain-socket harness).
 proc = subprocess.Popen(
-    ['java', '-cp', CLASSES + ':' + HARNESS + os.environ.get('E2E_CLASSPATH_EXTRA', ''),
-     os.environ.get('E2E_HARNESS_CLASS', 'E2EHarness'),
-     '10.0.0.50:80=127.0.0.1:18080', '10.0.0.52:80=127.0.0.1:18081', '8.8.8.8:53=127.0.0.1:15353']
-    + os.environ.get('E2E_HARNESS_ARGS', '').split(),
+    ['java', '-cp', CLASSES + ':' + HARNESS, 'E2EHarness',
+     '10.0.0.50:80=127.0.0.1:18080', '10.0.0.52:80=127.0.0.1:18081', '8.8.8.8:53=127.0.0.1:15353'],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open('/tmp/e2e_engine.log', 'wb'))
 
 def tun_to_java():
