@@ -71,10 +71,15 @@ public class TunnelVpnService extends android.net.VpnService {
     private PacketEngine engine;
     private OkHttpClient client;
     private Thread readerThread;
+    private volatile java.io.Closeable connectorCloser;   // SSH keeps a session open that must be closed on stop
 
     /** Parsed start request. */
     private static final class Cfg {
-        String uuid, hostHeader, sni, path, connectIp, dns, protocol, sshUsername, sshPassword, sshHost, payload;
+        String uuid, hostHeader, sni, path, connectIp, dns, protocol;
+        // SSH only
+        String sshUser, sshPass, sshHost, payload, proxyHost;
+        int sshPort = 22, proxyPort;
+        boolean wsFrames;
         int port;
         boolean insecureTls;
         boolean tls = true;
@@ -100,10 +105,6 @@ public class TunnelVpnService extends android.net.VpnService {
         cfg.protocol = intent.getStringExtra("protocol");
         if (cfg.protocol == null || cfg.protocol.trim().isEmpty()) cfg.protocol = "VLESS";
         cfg.uuid = intent.getStringExtra("uuid");
-        cfg.sshUsername = intent.getStringExtra("sshUsername");
-        cfg.sshPassword = intent.getStringExtra("sshPassword");
-        cfg.sshHost = intent.getStringExtra("sshHost");
-        cfg.payload = intent.getStringExtra("payload");
         cfg.hostHeader = intent.getStringExtra("server");
         cfg.sni = intent.getStringExtra("bug");
         cfg.path = intent.getStringExtra("path");
@@ -112,6 +113,14 @@ public class TunnelVpnService extends android.net.VpnService {
         cfg.port = intent.getIntExtra("port", 443);
         cfg.insecureTls = intent.getBooleanExtra("insecure", false);
         cfg.tls = !"Non-TLS".equals(intent.getStringExtra("transport"));
+        cfg.sshUser = intent.getStringExtra("sshUser");
+        cfg.sshPass = intent.getStringExtra("sshPass");
+        cfg.sshHost = intent.getStringExtra("sshHost");
+        cfg.sshPort = intent.getIntExtra("sshPort", 22);
+        cfg.payload = intent.getStringExtra("payload");
+        cfg.proxyHost = intent.getStringExtra("proxyHost");
+        cfg.proxyPort = intent.getIntExtra("proxyPort", 0);
+        cfg.wsFrames = intent.getBooleanExtra("wsFrames", false);
         if (cfg.dns == null || cfg.dns.trim().isEmpty()) cfg.dns = "8.8.8.8";
 
         Thread t = new Thread(new Runnable() {
@@ -140,15 +149,17 @@ public class TunnelVpnService extends android.net.VpnService {
             TunnelProtocol proto = ProtocolRegistry.require(cfg.protocol);
             if (proto.unavailableReason() != null) throw new IOException(proto.unavailableReason());
             TunnelState.set(TunnelState.State.CONNECTING, "Connecting");
-            TunnelState.log("Connect IP " + cfg.connectIp + ", SNI " + cfg.sni + ", Host " + cfg.hostHeader
-                    + ", path " + cfg.path + (cfg.insecureTls ? "  [TLS verification OFF]" : ""));
+            boolean ssh = "SSH".equalsIgnoreCase(proto.id());
+            if (ssh) {
+                TunnelState.log("Proxy " + cfg.proxyHost + ":" + cfg.proxyPort + (cfg.tls ? ", SNI " + cfg.sni : ", no SNI")
+                        + ", SSH user " + cfg.sshUser + (cfg.insecureTls && cfg.tls ? "  [TLS verification OFF]" : ""));
+            } else {
+                TunnelState.log("Connect IP " + cfg.connectIp + ", SNI " + cfg.sni + ", Host " + cfg.hostHeader
+                        + ", path " + cfg.path + (cfg.insecureTls ? "  [TLS verification OFF]" : ""));
+            }
 
             ProtocolConfig pc = new ProtocolConfig();
             pc.uuid = cfg.uuid;
-            pc.sshUsername = cfg.sshUsername;
-            pc.sshPassword = cfg.sshPassword;
-            pc.sshHost = cfg.sshHost;
-            pc.payload = cfg.payload;
             pc.hostHeader = cfg.hostHeader;
             pc.sni = cfg.sni;
             pc.path = cfg.path;
@@ -157,19 +168,33 @@ public class TunnelVpnService extends android.net.VpnService {
             pc.port = cfg.port;
             pc.tls = cfg.tls;
             pc.insecureTls = cfg.insecureTls;
+            pc.sshUser = cfg.sshUser;
+            pc.sshPassword = cfg.sshPass;
+            pc.sshHost = cfg.sshHost;
+            pc.sshPort = cfg.sshPort;
+            pc.payload = cfg.payload;
+            pc.proxyHost = cfg.proxyHost;
+            pc.proxyPort = cfg.proxyPort;
+            pc.wsFraming = cfg.wsFrames;
+            pc.socketFactory = new ProtectingSocketFactory(this);   // SSH sockets bypass the VPN
 
             TunnelState.log("Protocol: " + proto.id());
-            TunnelState.log("Transport: " + (cfg.tls ? "TLS (WSS)" : "Non-TLS (WS)"));
+            TunnelState.log("Transport: " + (ssh ? (cfg.tls ? "TLS with SNI" : "plain, no SNI")
+                    : (cfg.tls ? "TLS (WSS)" : "Non-TLS (WS)")));
 
             OkHttpClient c = buildClient(cfg);
             UpstreamConnector connector = proto.createConnector(c, pc);
+            if (connector instanceof java.io.Closeable) connectorCloser = (java.io.Closeable) connector;
             synchronized (lock) {
-                if (!active.get()) return;
+                if (!active.get()) {
+                    closeConnector();
+                    return;
+                }
                 client = c;
             }
 
             TunnelState.log("Checking the tunnel (DNS lookup through the server)...");
-            preflight(connector, cfg.dns);
+            preflight(connector, cfg.dns, ssh);
             TunnelState.log("Tunnel check OK");
 
             ParcelFileDescriptor pfd = buildTun();
@@ -200,7 +225,8 @@ public class TunnelVpnService extends android.net.VpnService {
             }
             updateNotification("Connected");
             TunnelState.set(TunnelState.State.CONNECTED, "Connected");
-            TunnelState.log("VPN is up. Apps are now routed through " + cfg.sni);
+            TunnelState.log("VPN is up. Apps are now routed through "
+                    + (ssh ? cfg.proxyHost : cfg.sni));
         } catch (Throwable t) {
             String msg = t.getMessage() != null ? t.getMessage() : t.toString();
             TunnelState.log("ERROR: " + msg);
@@ -209,7 +235,7 @@ public class TunnelVpnService extends android.net.VpnService {
     }
 
     /** Opens one tunnelled TCP connection to the DNS server and waits for a real answer. */
-    private void preflight(UpstreamConnector connector, String dns) throws IOException, InterruptedException {
+    private void preflight(UpstreamConnector connector, String dns, final boolean ssh) throws IOException, InterruptedException {
         final CountDownLatch done = new CountDownLatch(1);
         final AtomicReference<String> failure = new AtomicReference<String>();
         final byte[][] rx = {new byte[512]};
@@ -246,7 +272,10 @@ public class TunnelVpnService extends android.net.VpnService {
             }
             @Override public void onClosed(boolean error) {
                 if (done.getCount() > 0) {
-                    failure.compareAndSet(null, error
+                    failure.compareAndSet(null, ssh
+                            ? (error ? "could not open the SSH tunnel (see the log above: proxy reply, TLS, login or port-forwarding error)"
+                                     : "the SSH server closed the channel without answering (can it reach the internet / DNS?)")
+                            : error
                             ? "could not open the WebSocket (see log above: HTTP status / TLS error)"
                             : "server closed the connection without answering (wrong UUID, path, or the server cannot reach " + "the internet?)");
                     done.countDown();
@@ -262,6 +291,14 @@ public class TunnelVpnService extends android.net.VpnService {
             s.close();
         }
         if (failure.get() != null) throw new IOException("Tunnel check failed: " + failure.get());
+    }
+
+    private void closeConnector() {
+        java.io.Closeable cl = connectorCloser;
+        connectorCloser = null;
+        if (cl != null) {
+            try { cl.close(); } catch (IOException ignored) { }
+        }
     }
 
     private ParcelFileDescriptor buildTun() {
@@ -372,6 +409,7 @@ public class TunnelVpnService extends android.net.VpnService {
         }
         TunnelState.set(TunnelState.State.DISCONNECTING, "Disconnecting");
         if (eng != null) eng.shutdown();
+        closeConnector();
         if (reader != null && reader != Thread.currentThread()) {
             try { reader.join(1500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
