@@ -11,8 +11,17 @@ public final class ProtocolConfig {
     public int port = 443;
     public boolean tls = true;
     public boolean insecureTls;
-    public String sshUsername;
+
+    // ---- SSH-over-WebSocket only (ignored by VLESS / VMess)
+    public String sshUser;
     public String sshPassword;
-    public String sshHost;
-    public String payload;
+    public String sshHost;      // SSH server name as the payload sees it ([host]); falls back to proxyHost
+    public int sshPort = 22;
+    public String payload;      // payload template sent to the proxy before SSH starts
+    public String proxyHost;    // real TCP destination (your host server)
+    public int proxyPort;       // 443 with SNI (TLS), 80 without SNI
+    public boolean wsFraming;   // true = RFC 6455 frames after the upgrade, false = raw SSH after the 101 reply
+
+    /** Optional factory whose sockets bypass the VPN (set by the service). */
+    public javax.net.SocketFactory socketFactory;
 }

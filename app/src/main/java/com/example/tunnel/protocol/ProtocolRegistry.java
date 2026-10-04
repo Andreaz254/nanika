@@ -1,5 +1,6 @@
 package com.example.tunnel.protocol;
 
+import com.example.tunnel.ssh.SshProtocol;
 import com.example.tunnel.vless.VlessProtocol;
 import com.example.tunnel.vmess.VmessProtocol;
 
@@ -14,9 +15,7 @@ public final class ProtocolRegistry {
     static {
         register(new VlessProtocol());
         register(new VmessProtocol());
-        // Keep protocol-specific dependencies isolated so codec-only test harnesses remain independent.
-        try { register((TunnelProtocol) Class.forName("com.example.tunnel.ssh.SshProtocol").newInstance()); }
-        catch (Exception e) { /* SSH is unavailable only if its implementation cannot be loaded. */ }
+        register(new SshProtocol());
         // register(new TrojanProtocol());   <- add new protocols here
     }
 
