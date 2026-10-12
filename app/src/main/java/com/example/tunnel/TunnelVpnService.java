@@ -459,7 +459,7 @@ public class TunnelVpnService extends android.net.VpnService {
         PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
-                .setContentTitle("Bug Hunter VPN")
+                .setContentTitle("Nanika")
                 .setContentText(text)
                 .setContentIntent(pi)
                 .setOngoing(true)

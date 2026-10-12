@@ -3,6 +3,15 @@ package com.example.tunnel;
 import android.Manifest;
 import android.animation.LayoutTransition;
 import android.annotation.SuppressLint;
+import android.app.DatePickerDialog;
+import android.graphics.Outline;
+import android.graphics.Paint;
+import android.text.style.AbsoluteSizeSpan;
+import android.util.TypedValue;
+import android.view.ViewOutlineProvider;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -16,17 +25,22 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
+import android.text.Html;
+import android.text.Spannable;
+import android.text.SpannableStringBuilder;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.text.method.HideReturnsTransformationMethod;
 import android.text.method.PasswordTransformationMethod;
-import android.text.method.ScrollingMovementMethod;
+import android.text.style.ForegroundColorSpan;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -44,8 +58,10 @@ import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.PopupWindow;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -62,6 +78,15 @@ import com.example.tunnel.protocol.ProtocolRegistry;
 import com.example.tunnel.ui.ConnectButton;
 import com.example.tunnel.ui.GlyphDrawable;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URLEncoder;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -107,6 +132,15 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     private final int[] cardGlyph = {GlyphDrawable.SSH, GlyphDrawable.VLESS, GlyphDrawable.VMESS};
     private String shownProtocol;
     private boolean payloadExpanded;
+    private HorizontalScrollView logsHsv;      // unused now (logs wrap to the screen), kept so the swipe code stays simple
+    private LinearLayout infoCard;
+    private TextView infoExpiry, infoMsg;
+    private boolean followLogs = true;
+    private android.view.ViewTreeObserver.OnScrollChangedListener logScrollListener;
+    private PopupWindow menuPopup;
+    private String pendingFile;          // "import:SSH" / "export:VLESS" while the file picker is open
+    private static final String DEFAULT_SERVER = "naruto.freessh.indevs.in";
+    private static final String[] SSH_KEYS = {"sshHost", "user", "pass", "proxyHost", "proxyPort", "sni", "payload", "transport", "wsFrames"};
     private LayoutTransition bodyTransition;
     private float dragX0, dragY0;
     private boolean dragTracking;
@@ -130,6 +164,25 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 }
             });
 
+    private final ActivityResultLauncher<Intent> fileResult = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(), result -> {
+                String job = pendingFile;
+                pendingFile = null;
+                Intent data = result.getData();
+                if (job == null || result.getResultCode() != RESULT_OK || data == null || data.getData() == null) return;
+                String[] t = job.split(":");
+                final Uri uri = data.getData();
+                guarded(() -> {
+                    if ("import".equals(t[0])) {
+                        importBytes(t[1], readBytes(uri));
+                    } else {
+                        writeBytes(uri, "anika".equals(t[0]) ? exportAnika(t[1])
+                                : exportJson(t[1]).getBytes(Charset.forName("UTF-8")));
+                        Toast.makeText(this, "Exported", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            });
+
     private final ActivityResultLauncher<String> notificationPermission = registerForActivityResult(
             new ActivityResultContracts.RequestPermission(), granted -> askVpnPermission());
 
@@ -151,11 +204,13 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         TunnelState.setListener(this);
         if (logView != null) renderLog();
         refreshHome();
+        refreshInfo();
     }
 
     @Override
     protected void onDestroy() {
         TunnelState.setListener(null);
+        dismissMenu();
         ui.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
@@ -180,13 +235,19 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             boolean open = drawer.getVisibility() == View.VISIBLE;
             boolean openIt = !open && "home".equals(page) && dragX0 < dp(110) && dx > dp(56) && horizontal;
             boolean closeIt = open && dx < -dp(64) && horizontal;
-            if (openIt || closeIt) {
+            boolean logsIt = !open && "home".equals(page) && dx < -dp(72) && horizontal;
+            boolean backIt = !open && "logs".equals(page) && dx > dp(72) && horizontal
+                    && (logsHsv == null || logsHsv.getScrollX() == 0);
+            if (openIt || closeIt || logsIt || backIt) {
                 dragTracking = false;
                 MotionEvent cancel = MotionEvent.obtain(e);
                 cancel.setAction(MotionEvent.ACTION_CANCEL);
                 super.dispatchTouchEvent(cancel);
                 cancel.recycle();
-                if (openIt) openDrawer(); else closeDrawer();
+                if (openIt) openDrawer();
+                else if (closeIt) closeDrawer();
+                else if (logsIt) show("logs");
+                else show("home");
                 return true;
             }
         } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
@@ -280,12 +341,18 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         LinearLayout head = row();
         head.setGravity(Gravity.CENTER_VERTICAL);
         ImageView logo = new ImageView(this);
-        logo.setImageResource(R.drawable.ic_logo);
+        logo.setImageResource(R.drawable.nanika_avatar);
+        logo.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        logo.setOutlineProvider(new ViewOutlineProvider() {
+            @Override public void getOutline(View v, Outline o) { o.setOval(0, 0, v.getWidth(), v.getHeight()); }
+        });
+        logo.setClipToOutline(true);
+        logo.setElevation(dp(2));
         head.addView(logo, new LinearLayout.LayoutParams(dp(50), dp(50)));
         LinearLayout names = new LinearLayout(this);
         names.setOrientation(LinearLayout.VERTICAL);
         names.setPadding(dp(12), 0, 0, 0);
-        names.addView(text("Bug Hunter", 20, TEXT, true));
+        names.addView(text("Nanika", 20, TEXT, true));
         names.addView(text("Secure \u2022 Fast \u2022 Private", 12, MUTED, false));
         head.addView(names);
         drawer.addView(head, mp(-1, -2, 0, 0, 0, 22));
@@ -328,7 +395,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         menu.setOnClickListener(v -> openDrawer());
         pressable(menu, 0.88f);
         bar.addView(menu);
-        TextView title = text("Bug Hunter", 20, TEXT, true);
+        TextView title = text("Nanika", 20, TEXT, true);
         title.setPadding(dp(18), 0, 0, 0);
         bar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         FrameLayout dot = new FrameLayout(this);
@@ -339,13 +406,28 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         dotSpinner = icon(R.drawable.ic_spinner, 20, ORANGE);
         dot.addView(dotSpinner, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
         bar.addView(dot, new LinearLayout.LayoutParams(dp(24), dp(24)));
+        LinearLayout logsBtn = row();
+        logsBtn.setGravity(Gravity.CENTER_VERTICAL);
+        logsBtn.setPadding(dp(12), 0, dp(14), 0);
+        logsBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x55FFFFFF),
+                shape(ORANGE, 0, 0, 8), shape(Color.WHITE, 0, 0, 8)));
+        logsBtn.setElevation(dp(2));
+        logsBtn.addView(icon(R.drawable.ic_terminal, 16, Color.WHITE));
+        TextView lt = text("LOGS", 12, Color.WHITE, true);
+        lt.setLetterSpacing(0.08f);
+        lt.setPadding(dp(7), 0, 0, 0);
+        logsBtn.addView(lt);
+        logsBtn.setContentDescription("Open logs");
+        logsBtn.setOnClickListener(v -> show("logs"));
+        pressable(logsBtn, 0.94f);
+        bar.addView(logsBtn, mp(-2, 34, 12, 0, 0, 0));
         return bar;
     }
 
-    private View pageBar(String title, Runnable saveAction) {
+    private View pageBar(String title, final List<MenuItem> menu) {
         LinearLayout bar = row();
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(14), dp(10), dp(18), dp(6));
+        bar.setPadding(dp(14), dp(10), dp(10), dp(6));
         ImageView back = icon(R.drawable.ic_back, 26, ORANGE);
         back.setOnClickListener(v -> show("home"));
         pressable(back, 0.88f);
@@ -353,17 +435,42 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         TextView t = text(title, 18, TEXT, true);
         t.setPadding(dp(18), 0, 0, 0);
         bar.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
-        if (saveAction != null) {
-            LinearLayout save = row();
-            save.setGravity(Gravity.CENTER_VERTICAL);
-            save.addView(icon(R.drawable.ic_save, 18, ORANGE));
-            TextView s = text("SAVE", 12, ORANGE, true);
-            s.setPadding(dp(5), 0, 0, 0);
-            save.addView(s);
-            save.setOnClickListener(v -> saveAction.run());
-            pressable(save, 0.92f);
-            bar.addView(save);
+        if (menu != null) {
+            final ImageView more = icon(R.drawable.ic_more, 26, ORANGE);
+            more.setPadding(dp(5), dp(5), dp(5), dp(5));
+            more.setContentDescription("More options");
+            more.setOnClickListener(v -> showMenu(more, menu));
+            pressable(more, 0.85f);
+            bar.addView(more, new LinearLayout.LayoutParams(dp(38), dp(38)));
         }
+        return bar;
+    }
+
+    private View logsBar() {
+        LinearLayout bar = row();
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(dp(14), dp(10), dp(14), dp(6));
+        ImageView back = icon(R.drawable.ic_back, 26, ORANGE);
+        back.setOnClickListener(v -> show("home"));
+        pressable(back, 0.88f);
+        bar.addView(back);
+        TextView t = text("Logs", 18, TEXT, true);
+        t.setPadding(dp(18), 0, 0, 0);
+        bar.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView clear = text("CLEAR", 12, ORANGE, true);
+        clear.setPadding(dp(10), dp(8), dp(10), dp(8));
+        clear.setOnClickListener(v -> { TunnelState.clearLog(); renderLog(); });
+        pressable(clear, 0.92f);
+        bar.addView(clear);
+        ImageView copy = icon(R.drawable.ic_copy, 22, ORANGE);
+        copy.setPadding(dp(3), dp(3), dp(3), dp(3));
+        copy.setOnClickListener(v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("log", TunnelState.logText()));
+            Toast.makeText(this, "Logs copied", Toast.LENGTH_SHORT).show();
+        });
+        pressable(copy, 0.88f);
+        bar.addView(copy, new LinearLayout.LayoutParams(dp(30), dp(30)));
         return bar;
     }
 
@@ -374,18 +481,21 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         body.removeAllViews();
         hideKeyboard();
         body.setLayoutTransition(null);
-        Runnable save = this::saveAndHome;
+        dismissMenu();
         if ("home".equals(target)) {
             toolbarHolder.addView(homeBar());
             buildHome();
+        } else if ("logs".equals(target)) {
+            toolbarHolder.addView(logsBar());
+            buildLogs();
         } else if ("ssh".equals(target)) {
-            toolbarHolder.addView(pageBar("SSH Configuration", save));
+            toolbarHolder.addView(pageBar("SSH Configuration", menuFor("SSH")));
             buildSsh();
         } else if ("vless".equals(target)) {
-            toolbarHolder.addView(pageBar("VLESS Configuration", save));
+            toolbarHolder.addView(pageBar("VLESS Configuration", menuFor("VLESS")));
             buildWsConfig("VLESS");
         } else if ("vmess".equals(target)) {
-            toolbarHolder.addView(pageBar("VMess Configuration", save));
+            toolbarHolder.addView(pageBar("VMess Configuration", menuFor("VMess")));
             buildWsConfig("VMess");
         } else {
             toolbarHolder.addView(pageBar("Settings", null));
@@ -410,8 +520,13 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     }
 
     private void clearHomeRefs() {
+        if (logScrollListener != null && scroll != null) {
+            scroll.getViewTreeObserver().removeOnScrollChangedListener(logScrollListener);
+            logScrollListener = null;
+        }
+        infoCard = null; infoExpiry = null; infoMsg = null;
         connectBtn = null; statusIcon = null;
-        statusText = null; dotView = null; dotSpinner = null; logView = null;
+        statusText = null; dotView = null; dotSpinner = null; logView = null; logsHsv = null;
     }
 
     private void saveAndHome() {
@@ -484,48 +599,82 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 selectProtocol(name);
                 updateCards(changed && name.equals(protocol));
                 refreshHome();
+                refreshInfo();
             });
             pressable(cell, 0.95f);
             cards.addView(cell, mp(0, 88, i == 0 ? 0 : 5, 0, i == 2 ? 0 : 5, 0, 1));
         }
         body.addView(cards);
 
-        LinearLayout logs = new LinearLayout(this);
-        logs.setOrientation(LinearLayout.VERTICAL);
-        logs.setBackground(shape(CARD, ORANGE, 2, 12));
-        logs.setElevation(dp(2));
-        logs.setPadding(dp(12), dp(10), dp(12), dp(12));
-        LinearLayout head = row();
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        head.addView(text("CONNECTION LOGS", 12, TEXT, true), new LinearLayout.LayoutParams(0, -2, 1));
-        TextView clear = text("CLEAR", 11, ORANGE, true);
-        clear.setPadding(dp(8), dp(6), dp(8), dp(6));
-        clear.setOnClickListener(v -> { TunnelState.clearLog(); renderLog(); });
-        head.addView(clear);
-        ImageView copy = icon(R.drawable.ic_copy, 18, ORANGE);
-        copy.setPadding(dp(4), dp(4), dp(4), dp(4));
-        copy.setOnClickListener(v -> {
-            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("log", TunnelState.logText()));
-            Toast.makeText(this, "Logs copied", Toast.LENGTH_SHORT).show();
-        });
-        head.addView(copy, new LinearLayout.LayoutParams(dp(26), dp(26)));
-        logs.addView(head);
-        logView = text("", 11, TEXT, false);
-        logView.setTypeface(Typeface.MONOSPACE);
-        logView.setPadding(0, dp(8), 0, 0);
-        logView.setMovementMethod(new ScrollingMovementMethod());
-        logView.setOnTouchListener((v, e) -> {
-            if (e.getAction() == MotionEvent.ACTION_DOWN) v.getParent().requestDisallowInterceptTouchEvent(true);
-            return false;
-        });
-        logs.addView(logView, new LinearLayout.LayoutParams(-1, dp(150)));
-        body.addView(logs, mp(-1, -2, 0, 22, 0, 0));
+        infoCard = new LinearLayout(this);
+        infoCard.setOrientation(LinearLayout.VERTICAL);
+        infoCard.setBackground(shape(CARD, BORDER, 1, 12));
+        infoCard.setElevation(dp(2));
+        infoCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        infoExpiry = text("", 13, TEXT, true);
+        infoMsg = text("", 12, TEXT, false);
+        infoMsg.setTypeface(Typeface.MONOSPACE);
+        infoCard.addView(infoExpiry);
+        infoCard.addView(infoMsg, mp(-1, -2, 0, 8, 0, 0));
+        body.addView(infoCard, mp(-1, -2, 0, 18, 0, 0));
 
         shownProtocol = null;
         updateCards(false);
-        renderLog();
         refreshHome();
+        refreshInfo();
+    }
+
+    private float spPx(float sp) {
+        return TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, sp, getResources().getDisplayMetrics());
+    }
+
+    /** Largest monospace size (<= maxPx) at which the widest line of the text still fits in availPx. */
+    private float fitSize(CharSequence text, float availPx, float maxPx, float minPx) {
+        Paint pt = new Paint();
+        pt.setTypeface(Typeface.MONOSPACE);
+        pt.setTextSize(100f);
+        float widest = 0f;
+        for (String line : text.toString().split("\n")) widest = Math.max(widest, pt.measureText(line));
+        if (widest <= 0f) return maxPx;
+        return Math.max(minPx, Math.min(maxPx, 100f * availPx / widest));
+    }
+
+    /** Expiry line + HTML message of the selected protocol's configuration, shown under the protocol cards. */
+    private void refreshInfo() {
+        if (infoCard == null) return;
+        String exp = nz(p(protocol, "expiry", ""));
+        String msg = p(protocol, "message", "");
+        boolean hasExp = !exp.isEmpty(), hasMsg = !msg.trim().isEmpty();
+        infoCard.setVisibility(hasExp || hasMsg ? View.VISIBLE : View.GONE);
+        if (hasExp) {
+            int color = TEXT;
+            String label = "Expiry: " + exp;
+            try {
+                Date d = new SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(exp);
+                Calendar today = Calendar.getInstance();
+                today.set(Calendar.HOUR_OF_DAY, 0); today.set(Calendar.MINUTE, 0);
+                today.set(Calendar.SECOND, 0); today.set(Calendar.MILLISECOND, 0);
+                long days = Math.round((d.getTime() - today.getTimeInMillis()) / 86400000.0);
+                if (days > 3) { label = "Expires " + exp + "  \u2022  " + days + " days left"; color = GREEN; }
+                else if (days > 0) { label = "Expires " + exp + "  \u2022  " + days + (days == 1 ? " day left" : " days left"); color = ORANGE; }
+                else if (days == 0) { label = "Expires today"; color = ORANGE; }
+                else { label = "Expired " + exp + "  \u2022  " + (-days) + (days == -1 ? " day ago" : " days ago"); color = RED; }
+            } catch (java.text.ParseException ignored) { }
+            infoExpiry.setText(label);
+            infoExpiry.setTextColor(color);
+            infoExpiry.setVisibility(View.VISIBLE);
+        } else {
+            infoExpiry.setVisibility(View.GONE);
+        }
+        if (hasMsg) {
+            CharSequence sp = bannerToSpanned(msg);
+            float avail = getResources().getDisplayMetrics().widthPixels - dp(36) - dp(28) - dp(4);
+            infoMsg.setTextSize(TypedValue.COMPLEX_UNIT_PX, fitSize(sp, avail, spPx(12), spPx(5)));
+            infoMsg.setText(sp);
+            infoMsg.setVisibility(View.VISIBLE);
+        } else {
+            infoMsg.setVisibility(View.GONE);
+        }
     }
 
     private void updateCards(boolean animate) {
@@ -633,29 +782,132 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 || l.contains("rejected") || l.contains("denied") || l.contains("lost");
     }
 
-    private void renderLog() {
-        if (logView == null) return;
-        StringBuilder sb = new StringBuilder();
-        for (String line : TunnelState.logText().split("\n")) {
-            if (!line.isEmpty() && passesLogFilter(line)) sb.append(line).append('\n');
-        }
-        logView.setText(sb.toString());
-        scrollLogToEnd();
+    private void buildLogs() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(shape(CARD, ORANGE, 2, 12));
+        card.setElevation(dp(2));
+        card.setPadding(dp(12), dp(12), dp(12), dp(12));
+        logView = text("", 11, TEXT, false);
+        logView.setTypeface(Typeface.MONOSPACE);
+        logView.setTextIsSelectable(true);
+        logView.setHighlightColor(0x55F26B21);
+        card.addView(logView, new LinearLayout.LayoutParams(-1, -2));
+        body.addView(card, mp(-1, -2, 0, 0, 0, 0));
+        followLogs = true;
+        // whenever the text grows and the reader is at the bottom, stay at the bottom
+        logView.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, orr, ob) -> {
+            if (followLogs && (b - t) != (ob - ot)) pinLogsToBottom();
+        });
+        logScrollListener = () -> { if (logView != null) followLogs = nearLogBottom(); };
+        scroll.getViewTreeObserver().addOnScrollChangedListener(logScrollListener);
+        renderLog();
+        pinLogsToBottom();
     }
 
-    private void scrollLogToEnd() {
-        logView.post(() -> {
-            if (logView == null || logView.getLayout() == null) return;
-            int y = logView.getLayout().getLineTop(logView.getLineCount()) - logView.getHeight();
-            logView.scrollTo(0, Math.max(y, 0));
-        });
+    private void pinLogsToBottom() {
+        Runnable down = () -> {
+            View c = scroll.getChildAt(0);
+            if (c != null) scroll.scrollTo(0, c.getHeight());
+        };
+        scroll.post(down);
+        scroll.postDelayed(down, 90);
+    }
+
+    private float logAvailPx() {
+        return getResources().getDisplayMetrics().widthPixels - dp(36) - dp(24) - dp(4);
+    }
+
+    private void renderLog() {
+        if (logView == null) return;
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        for (String e : TunnelState.logEntries()) appendEntry(sb, e);
+        if (sb.length() == 0) {
+            sb.append("No logs yet. Connect and the server responses (101 Switching Protocols, SSH banner) show up here.");
+            sb.setSpan(new ForegroundColorSpan(MUTED), 0, sb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        logView.setText(sb);
+    }
+
+    /** Adds one stored log entry (a normal line, or a multi-line SSH banner) to the builder. */
+    private void appendEntry(SpannableStringBuilder sb, String entry) {
+        if (entry == null || entry.isEmpty()) return;
+        if (entry.charAt(0) == TunnelState.BANNER) {
+            int i = entry.indexOf(TunnelState.BANNER, 1);
+            if (i < 0) return;
+            int start = sb.length();
+            sb.append("[").append(entry.substring(1, i)).append("] SSH banner:\n");
+            sb.setSpan(new ForegroundColorSpan(ORANGE), start, sb.length() - 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            CharSequence banner = bannerToSpanned(entry.substring(i + 1));
+            int bs = sb.length();
+            sb.append(banner);
+            float px = fitSize(banner, logAvailPx(), spPx(11), spPx(5));     // shrink wide ASCII art to fit, never scroll sideways
+            if (px < spPx(11) - 0.5f) sb.setSpan(new AbsoluteSizeSpan((int) px, false), bs, sb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            if (sb.length() == 0 || sb.charAt(sb.length() - 1) != '\n') sb.append('\n');
+            return;
+        }
+        if (!passesLogFilter(entry)) return;
+        int start = sb.length();
+        sb.append(entry).append('\n');
+        String l = entry.toLowerCase(Locale.US);
+        int color = 0;
+        if (l.contains(" 101 ") || l.contains("logged in") || l.contains("established")) color = GREEN;
+        else if (l.contains("error") || l.contains("fail") || l.contains("rejected") || l.contains("denied")
+                || l.contains("refused") || l.contains("lost")) color = RED;
+        if (color != 0) sb.setSpan(new ForegroundColorSpan(color), start, sb.length() - 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
+
+    /**
+     * Turns an SSH banner into styled text. Plain banners stay as they are. HTML banners (font colours, h1-h6,
+     * br, b, i ...) are rendered; line breaks and runs of spaces in the source are kept so ASCII art stays aligned.
+     */
+    private CharSequence bannerToSpanned(String raw) {
+        String text = raw.replace("\r\n", "\n").replace('\r', '\n');
+        if (!text.matches("(?s).*<\\s*/?\\s*[a-zA-Z][^>]*>.*")) return text;
+        StringBuilder out = new StringBuilder(text.length() * 2);
+        boolean inTag = false, skipNl = false;
+        StringBuilder tag = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (inTag) {
+                out.append(ch);
+                tag.append(ch);
+                if (ch == '>') {
+                    inTag = false;
+                    skipNl = tag.length() > 1 && tag.charAt(1) != '/';     // newline right after an opening tag is layout only
+                }
+            } else if (ch == '<') {
+                inTag = true;
+                tag.setLength(0);
+                tag.append(ch);
+                out.append(ch);
+            } else if (ch == '\n') {
+                if (skipNl) skipNl = false; else out.append("<br>");
+            } else {
+                skipNl = false;
+                if (ch == ' ') out.append("&nbsp;");
+                else if (ch == '\t') out.append("&nbsp;&nbsp;&nbsp;&nbsp;");
+                else out.append(ch);
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 24) return Html.fromHtml(out.toString(), Html.FROM_HTML_MODE_LEGACY);
+        return Html.fromHtml(out.toString());
+    }
+
+    private boolean nearLogBottom() {
+        View c = scroll.getChildAt(0);
+        return c == null || c.getBottom() - (scroll.getHeight() + scroll.getScrollY()) < dp(160);
     }
 
     @Override
     public void onLog(String line) {
-        if (logView == null || !passesLogFilter(line)) return;
-        logView.append(line + "\n");
-        scrollLogToEnd();
+        if (logView == null) return;
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        appendEntry(sb, line);
+        if (sb.length() == 0) return;
+        followLogs = nearLogBottom();
+        if (logView.getText().toString().startsWith("No logs yet")) logView.setText(sb); else logView.append(sb);
+        if (followLogs) pinLogsToBottom();
     }
 
     @Override
@@ -719,6 +971,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             pass.setSelection(pass.getText().length());
         });
         add(collapsible, rowField("Password", passBox));
+        add(collapsible, rowField("Server Address", fieldSized(field(P, "sshHost", "server address", DEFAULT_SERVER))));
 
         add(collapsible, section("PROXY / SERVER"));
         add(collapsible, rowField("Proxy Host (WebSocket)", fieldSized(field(P, "proxyHost", "your host server", ""))));
@@ -739,9 +992,6 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                     if (cur.isEmpty() || cur.equals("443") || cur.equals("80")) proxyPort.setText(t ? "443" : "80");
                 }));
         add(collapsible, sniBox);
-
-        add(collapsible, section("WEBSOCKET"));
-        add(collapsible, rowField("Path (optional)", fieldSized(field(P, "path", "/ws", ""))));
 
         // PAYLOAD (resizable: grows with the text, expandable to a full editor)
         LinearLayout head = row();
@@ -771,15 +1021,497 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             }
         });
 
-        addTextNote("Placeholders: [crlf] [host] [host_port] [sni] [proxy] [path] [split] ...  Empty = standard WebSocket upgrade.");
+        addTextNote("Placeholders: [crlf] [host] [host_port] [sni] [proxy] [split] ...  Empty = standard WebSocket upgrade.");
+        addInfoSection(P, collapsible);
         addButtons(() -> {
-            String[] keys = {"sshHost", "user", "pass", "proxyHost", "proxyPort", "sni", "path", "payload", "transport", "wsFrames"};
+            String[] keys = {"sshHost", "user", "pass", "proxyHost", "proxyPort", "sni", "payload", "transport", "wsFrames", "expiry", "message"};
             SharedPreferences.Editor e = prefs.edit();
             for (String k : keys) e.remove(P + "_" + k);
             e.apply();
             Toast.makeText(this, "SSH settings reset", Toast.LENGTH_SHORT).show();
             show("ssh");
         });
+    }
+
+    /** Expiry date + HTML message that travel with a configuration and are shown on the home page. */
+    private void addInfoSection(String P, List<View> into) {
+        List<View> parts = new ArrayList<View>();
+        parts.add(section("EXPIRY & MESSAGE"));
+        final EditText exp = field(P, "expiry", "YYYY-MM-DD (optional)", "");
+        exp.setFocusable(false);
+        exp.setCursorVisible(false);
+        exp.setClickable(true);
+        exp.setOnClickListener(v -> pickDate(exp));
+        parts.add(rowField("Expiry", fieldSized(exp)));
+        LinearLayout lab = row();
+        lab.addView(text("Message (HTML)", 13, TEXT, false));
+        parts.add(lab);
+        parts.add(multilineField(P, "message", "<font color=\"#ff3333\">Welcome!</font><br>Valid until the expiry date", 90));
+        for (View v : parts) {
+            if (v instanceof EditText) body.addView(v, mp(-1, -2, 0, 4, 0, 0)); else body.addView(v);
+            if (into != null) into.add(v);
+        }
+    }
+
+    private void pickDate(final EditText target) {
+        Calendar c = Calendar.getInstance();
+        try {
+            Date d = new SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(target.getText().toString().trim());
+            if (d != null) c.setTime(d);
+        } catch (java.text.ParseException ignored) { }
+        DatePickerDialog dlg = new DatePickerDialog(this, (view, y, mo, d) ->
+                target.setText(String.format(Locale.US, "%04d-%02d-%02d", y, mo + 1, d)),
+                c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH));
+        dlg.setButton(DatePickerDialog.BUTTON_NEUTRAL, "Clear", (d2, w) -> target.setText(""));
+        dlg.show();
+    }
+
+    // ================================================================== three-dots menus
+
+    private static final class MenuItem {
+        final String label;
+        final Runnable action;
+        final List<MenuItem> children;
+        MenuItem(String label, Runnable action, List<MenuItem> children) {
+            this.label = label;
+            this.action = action;
+            this.children = children;
+        }
+    }
+
+    private static MenuItem item(String label, Runnable action) { return new MenuItem(label, action, null); }
+
+    private static MenuItem group(String label, MenuItem... kids) {
+        return new MenuItem(label, null, new ArrayList<MenuItem>(Arrays.asList(kids)));
+    }
+
+    private List<MenuItem> menuFor(final String P) {
+        List<MenuItem> m = new ArrayList<MenuItem>();
+        if ("SSH".equals(P)) {
+            m.add(item("Import file", () -> pickFile("import", P)));
+            m.add(item("Export file (.anika)", () -> pickFile("anika", P)));
+            m.add(group("Inject payload",
+                    item("Cloudflare", () -> comingSoon("Cloudflare")),
+                    item("Enhanced", () -> comingSoon("Enhanced")),
+                    item("Direct", () -> comingSoon("Direct"))));
+        } else {
+            m.add(group("Import",
+                    item("From clipboard", () -> guarded(() -> importClipboard(P))),
+                    item("From file (.anika / JSON)", () -> pickFile("import", P))));
+            m.add(group("Export",
+                    item("To clipboard (link)", () -> guarded(() -> exportClipboard(P))),
+                    item("To file (.anika)", () -> pickFile("anika", P)),
+                    item("To JSON file", () -> pickFile("json", P))));
+        }
+        return m;
+    }
+
+    private void comingSoon(String name) {
+        Toast.makeText(this, name + " payload injection is not available yet", Toast.LENGTH_SHORT).show();
+    }
+
+    private void dismissMenu() {
+        if (menuPopup != null) {
+            try { menuPopup.dismiss(); } catch (RuntimeException ignored) { }
+            menuPopup = null;
+        }
+    }
+
+    private void showMenu(View anchor, List<MenuItem> items) {
+        dismissMenu();
+        final int cardW = dp(226);
+        final int pad = dp(12);
+        FrameLayout frame = new FrameLayout(this);
+        frame.setPadding(pad, pad, pad, pad);
+        final LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(6), dp(6), dp(6), dp(6));
+        card.setBackground(shape(CARD, BORDER, 1, 14));
+        card.setElevation(dp(8));
+        frame.addView(card, new FrameLayout.LayoutParams(cardW, -2));
+        final PopupWindow pw = new PopupWindow(frame, cardW + 2 * pad, ViewGroup.LayoutParams.WRAP_CONTENT, true);
+        pw.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        pw.setAnimationStyle(0);
+        pw.setOutsideTouchable(true);
+        fillMenu(card, pw, null, items, items);
+        menuPopup = pw;
+        pw.showAsDropDown(anchor, anchor.getWidth() - (cardW + 2 * pad) + dp(6), -dp(10));
+        card.setPivotX(cardW);
+        card.setPivotY(0);
+        card.setScaleX(0.82f);
+        card.setScaleY(0.82f);
+        card.setAlpha(0f);
+        card.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(200)
+                .setInterpolator(new DecelerateInterpolator(1.6f)).start();
+    }
+
+    private void fillMenu(final LinearLayout card, final PopupWindow pw, String header,
+                          List<MenuItem> items, final List<MenuItem> root) {
+        card.removeAllViews();
+        if (header != null) {
+            TextView back = text("\u2039   " + header, 14, ORANGE, true);
+            back.setGravity(Gravity.CENTER_VERTICAL);
+            back.setPadding(dp(14), 0, dp(14), 0);
+            back.setBackground(rippled(null, 10));
+            back.setOnClickListener(v -> swapMenu(card, pw, null, root, root));
+            card.addView(back, new LinearLayout.LayoutParams(-1, dp(44)));
+        }
+        for (final MenuItem it : items) {
+            LinearLayout row = row();
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(14), 0, dp(12), 0);
+            row.setBackground(rippled(null, 10));
+            row.addView(text(it.label, 15, TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
+            if (it.children != null) row.addView(text("\u203A", 20, ORANGE, true));
+            row.setOnClickListener(v -> {
+                if (it.children != null) {
+                    swapMenu(card, pw, it.label, it.children, root);
+                } else {
+                    pw.dismiss();
+                    if (it.action != null) it.action.run();
+                }
+            });
+            card.addView(row, new LinearLayout.LayoutParams(-1, dp(46)));
+        }
+    }
+
+    private void swapMenu(final LinearLayout card, final PopupWindow pw, final String header,
+                          final List<MenuItem> items, final List<MenuItem> root) {
+        card.animate().alpha(0f).setDuration(90).withEndAction(() -> {
+            fillMenu(card, pw, header, items, root);
+            card.animate().alpha(1f).setDuration(140).start();
+        }).start();
+    }
+
+    // ================================================================== import / export
+
+    private void guarded(Runnable r) {
+        try {
+            r.run();
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void pickFile(String kind, String P) {
+        Intent i;
+        if ("import".equals(kind)) {
+            i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+        } else {
+            boolean anika = "anika".equals(kind);
+            i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType(anika ? "application/octet-stream" : "application/json");
+            i.putExtra(Intent.EXTRA_TITLE, "nanika-" + P.toLowerCase(Locale.US) + (anika ? ".anika" : ".json"));
+        }
+        pendingFile = kind + ":" + P;
+        try {
+            fileResult.launch(i);
+        } catch (RuntimeException e) {
+            pendingFile = null;
+            Toast.makeText(this, "No file picker available on this device", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void importClipboard(String P) {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        String text = "";
+        if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null && cm.getPrimaryClip().getItemCount() > 0) {
+            CharSequence cs = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
+            if (cs != null) text = cs.toString();
+        }
+        if (text.trim().isEmpty()) throw new IllegalArgumentException("The clipboard is empty");
+        importText(P, text);
+    }
+
+    private void exportClipboard(String P) {
+        String text = exportText(P);
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("config", text));
+        Toast.makeText(this, P + " link copied to the clipboard", Toast.LENGTH_SHORT).show();
+    }
+
+    private byte[] readBytes(Uri uri) {
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IllegalStateException("Cannot open that file");
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n, total = 0;
+            while ((n = in.read(buf)) > 0) {
+                total += n;
+                if (total > 512 * 1024) throw new IllegalArgumentException("That file is too large to be a configuration");
+                bo.write(buf, 0, n);
+            }
+            return bo.toByteArray();
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not read the file: " + e.getMessage());
+        }
+    }
+
+    private void writeBytes(Uri uri, byte[] data) {
+        try (OutputStream os = getContentResolver().openOutputStream(uri, "wt")) {
+            if (os == null) throw new IllegalStateException("Cannot write that file");
+            os.write(data);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not write the file: " + e.getMessage());
+        }
+    }
+
+    private static String enc(String v) {
+        try {
+            return URLEncoder.encode(v, "UTF-8");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return v;
+        }
+    }
+
+    private static String nz(String v) { return v == null ? "" : v.trim(); }
+
+    private static final String[] WS_KEYS = {"uuid", "server", "connectIp", "port", "transport", "sni", "path", "insecure"};
+
+    private static String[] keysFor(String P) {
+        String[] base = "SSH".equals(P) ? SSH_KEYS : WS_KEYS;
+        String[] all = Arrays.copyOf(base, base.length + 2);
+        all[base.length] = "expiry";
+        all[base.length + 1] = "message";
+        return all;
+    }
+
+    private static String niceName(String type) {
+        return "vless".equals(type) ? "VLESS" : "vmess".equals(type) ? "VMess" : "ssh".equals(type) ? "SSH" : type;
+    }
+
+    /** Everything on the page (including expiry and message) as one JSON object. */
+    private JSONObject configJson(String P) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("app", "nanika");
+            o.put("version", 1);
+            o.put("type", P.toLowerCase(Locale.US));
+            java.util.Map<String, ?> all = prefs.getAll();
+            for (String k : keysFor(P)) {
+                Object v = all.get(P + "_" + k);
+                if (v instanceof String || v instanceof Boolean) o.put(k, v);
+            }
+            if ("SSH".equals(P) && !o.has("sshHost")) o.put("sshHost", DEFAULT_SERVER);
+            return o;
+        } catch (JSONException e) {
+            throw new IllegalStateException("Could not build the export: " + e.getMessage());
+        }
+    }
+
+    private String exportJson(String P) {
+        try {
+            return configJson(P).toString(2);
+        } catch (JSONException e) {
+            throw new IllegalStateException("Could not build the export: " + e.getMessage());
+        }
+    }
+
+    /** Encrypted .anika file contents. */
+    private byte[] exportAnika(String P) {
+        try {
+            return AnikaCrypto.encrypt(configJson(P).toString());
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not encrypt the export: " + e.getMessage());
+        }
+    }
+
+    /** vless:// or vmess:// link for the clipboard. */
+    private String exportText(String P) {
+        try {
+            String uuid = p(P, "uuid", "").trim();
+            String server = p(P, "server", "").trim();
+            String ip = p(P, "connectIp", "").trim();
+            if (uuid.isEmpty()) throw new IllegalStateException("The UUID is empty - fill in the " + P + " page first");
+            String host = ip.isEmpty() ? server : ip;
+            if (host.isEmpty()) throw new IllegalStateException("Connect host / server is empty - fill in the " + P + " page first");
+            int port = intOr(p(P, "port", "443"), 443);
+            boolean tls = tlsOn(P);
+            String sni = p(P, "sni", "").trim();
+            if (sni.isEmpty()) sni = server.isEmpty() ? host : server;
+            String path = p(P, "path", "").trim();
+            if (path.isEmpty()) path = "/";
+            if (!path.startsWith("/")) path = "/" + path;
+            boolean insecure = prefs.getBoolean(P + "_insecure", false);
+
+            if ("VLESS".equals(P)) {
+                StringBuilder u = new StringBuilder("vless://").append(uuid).append('@')
+                        .append(host.indexOf(':') >= 0 && !host.startsWith("[") ? "[" + host + "]" : host)
+                        .append(':').append(port)
+                        .append("?encryption=none&security=").append(tls ? "tls" : "none");
+                if (tls) u.append("&sni=").append(enc(sni)).append("&fp=chrome");
+                u.append("&type=ws");
+                if (!server.isEmpty()) u.append("&host=").append(enc(server));
+                u.append("&path=").append(enc(path));
+                if (insecure) u.append("&allowInsecure=1");
+                u.append("#Nanika-VLESS");
+                return u.toString();
+            }
+            JSONObject o = new JSONObject();
+            o.put("v", "2");
+            o.put("ps", "Nanika-VMess");
+            o.put("add", host);
+            o.put("port", String.valueOf(port));
+            o.put("id", uuid);
+            o.put("aid", "0");
+            o.put("scy", "auto");
+            o.put("net", "ws");
+            o.put("type", "none");
+            o.put("host", server);
+            o.put("path", path);
+            o.put("tls", tls ? "tls" : "");
+            o.put("sni", tls ? sni : "");
+            return "vmess://" + Base64.encodeToString(o.toString().getBytes(Charset.forName("UTF-8")), Base64.NO_WRAP);
+        } catch (JSONException e) {
+            throw new IllegalStateException("Could not build the export: " + e.getMessage());
+        }
+    }
+
+    /** .anika (encrypted) or plain text/JSON/link read from a file. */
+    private void importBytes(String P, byte[] data) {
+        String text = AnikaCrypto.looksEncrypted(data) ? AnikaCrypto.decrypt(data)
+                : new String(data, Charset.forName("UTF-8"));
+        importText(P, text);
+    }
+
+    private void importText(String P, String raw) {
+        if (raw == null || raw.trim().isEmpty()) throw new IllegalArgumentException("Nothing to import - the text is empty");
+        String text = raw.trim();
+        if (text.startsWith("\uFEFF")) text = text.substring(1).trim();
+        if (text.startsWith("{")) {
+            importConfigJson(P, text);
+        } else if ("SSH".equals(P)) {
+            throw new IllegalArgumentException("That is not a Nanika SSH file");
+        } else {
+            String scheme = P.toLowerCase(Locale.US) + "://";
+            String link = null;
+            for (String tok : text.split("\\s+")) {
+                if (tok.toLowerCase(Locale.US).startsWith(scheme)) { link = tok; break; }
+            }
+            if (link == null) {
+                String other = "vless".equals(P.toLowerCase(Locale.US)) ? "vmess://" : "vless://";
+                if (text.toLowerCase(Locale.US).contains(other)) {
+                    throw new IllegalArgumentException("That is a " + other + " link - import it on the "
+                            + ("vless://".equals(other) ? "VLESS" : "VMess") + " page");
+                }
+                throw new IllegalArgumentException("No " + scheme + " link found");
+            }
+            // a link carries no expiry / message, so keep whatever this page already has
+            if ("VLESS".equals(P)) importVless(link); else importVmess(link);
+        }
+        Toast.makeText(this, P + " configuration imported", Toast.LENGTH_SHORT).show();
+        show(P.toLowerCase(Locale.US));
+    }
+
+    private void importConfigJson(String P, String text) {
+        JSONObject o;
+        try {
+            o = new JSONObject(text);
+        } catch (JSONException e) {
+            throw new IllegalArgumentException("That is not a valid configuration file");
+        }
+        String type = o.optString("type", "").toLowerCase(Locale.US);
+        if (type.equals("bughunter-ssh")) type = "ssh";
+        if (!type.isEmpty() && !type.equals(P.toLowerCase(Locale.US))) {
+            throw new IllegalArgumentException("That file is a " + niceName(type) + " configuration - import it on the "
+                    + niceName(type) + " page");
+        }
+        String uuid = o.optString("uuid", "");
+        if (!"SSH".equals(P) && !uuid.isEmpty() && !validUuid(uuid.trim())) {
+            throw new IllegalArgumentException("The file has an invalid UUID");
+        }
+        SharedPreferences.Editor e = prefs.edit();
+        int n = 0;
+        for (String k : keysFor(P)) {
+            Object v = o.opt(k);
+            if (v instanceof String) { e.putString(P + "_" + k, (String) v); n++; }
+            else if (v instanceof Boolean) { e.putBoolean(P + "_" + k, (Boolean) v); n++; }
+            else if ((k.equals("expiry") || k.equals("message"))) e.remove(P + "_" + k);   // no stale expiry from before
+        }
+        if (n == 0) throw new IllegalArgumentException("That file has no settings in it");
+        e.apply();
+    }
+
+    private static boolean validUuid(String u) {
+        return u != null && u.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+    }
+
+    private void storeWsConfig(String P, String uuid, String connect, int port, boolean tls, String sni,
+                               String server, String path, boolean insecure) {
+        prefs.edit()
+                .putString(P + "_uuid", uuid)
+                .putString(P + "_connectIp", connect)
+                .putString(P + "_port", String.valueOf(port))
+                .putString(P + "_transport", tls ? "TLS" : "Non-TLS")
+                .putString(P + "_sni", sni)
+                .putString(P + "_server", server)
+                .putString(P + "_path", path.isEmpty() ? "/" : path)
+                .putBoolean(P + "_insecure", insecure)
+                .apply();
+    }
+
+    private void importVless(String link) {
+        Uri u = Uri.parse(link);
+        String uuid = nz(u.getUserInfo());
+        if (!validUuid(uuid)) throw new IllegalArgumentException("The vless:// link has no valid UUID");
+        String host = nz(u.getHost());
+        if (host.isEmpty()) throw new IllegalArgumentException("The vless:// link has no server address");
+        int port = u.getPort() > 0 ? u.getPort() : 443;
+        String type = nz(u.getQueryParameter("type")).toLowerCase(Locale.US);
+        if (!type.isEmpty() && !type.equals("ws")) {
+            throw new IllegalArgumentException("Only WebSocket links are supported (this one is type=" + type + ")");
+        }
+        String sec = nz(u.getQueryParameter("security")).toLowerCase(Locale.US);
+        if (sec.equals("reality")) throw new IllegalArgumentException("REALITY links are not supported");
+        boolean tls = sec.equals("tls");
+        String hostParam = nz(u.getQueryParameter("host"));
+        String sniParam = nz(u.getQueryParameter("sni"));
+        String sni = !sniParam.isEmpty() ? sniParam : !hostParam.isEmpty() ? hostParam : host;
+        String server = !hostParam.isEmpty() ? hostParam : sni;
+        String path = nz(u.getQueryParameter("path"));
+        String ins = nz(u.getQueryParameter("allowInsecure")) + nz(u.getQueryParameter("insecure"));
+        storeWsConfig("VLESS", uuid, host, port, tls, sni, server, path, ins.startsWith("1") || ins.startsWith("true"));
+    }
+
+    private void importVmess(String link) {
+        String b64 = link.substring("vmess://".length());
+        int hash = b64.indexOf('#');
+        if (hash >= 0) b64 = b64.substring(0, hash);
+        b64 = b64.replaceAll("\\s", "");
+        byte[] raw;
+        try {
+            raw = Base64.decode(b64, Base64.DEFAULT);
+        } catch (IllegalArgumentException e1) {
+            try {
+                raw = Base64.decode(b64, Base64.URL_SAFE);
+            } catch (IllegalArgumentException e2) {
+                throw new IllegalArgumentException("The vmess:// link is not valid base64");
+            }
+        }
+        JSONObject o;
+        try {
+            o = new JSONObject(new String(raw, Charset.forName("UTF-8")));
+        } catch (JSONException e) {
+            throw new IllegalArgumentException("The vmess:// link does not contain a valid configuration");
+        }
+        String uuid = nz(o.optString("id", ""));
+        if (!validUuid(uuid)) throw new IllegalArgumentException("The vmess:// link has no valid UUID");
+        String add = nz(o.optString("add", ""));
+        if (add.isEmpty()) throw new IllegalArgumentException("The vmess:// link has no server address");
+        String net = nz(o.optString("net", "")).toLowerCase(Locale.US);
+        if (!net.isEmpty() && !net.equals("ws")) {
+            throw new IllegalArgumentException("Only WebSocket links are supported (this one is net=" + net + ")");
+        }
+        int port = intOr(nz(o.optString("port", "443")), 443);
+        boolean tls = nz(o.optString("tls", "")).equalsIgnoreCase("tls");
+        String hostParam = nz(o.optString("host", ""));
+        String sniParam = nz(o.optString("sni", ""));
+        String sni = !sniParam.isEmpty() ? sniParam : !hostParam.isEmpty() ? hostParam : add;
+        String server = !hostParam.isEmpty() ? hostParam : sni;
+        storeWsConfig("VMess", uuid, add, port, tls, sni, server, nz(o.optString("path", "")), false);
     }
 
     // ================================================================== VLESS / VMess configuration page
@@ -811,9 +1543,10 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 (b, on) -> prefs.edit().putBoolean(P + "_insecure", on).apply()));
         body.addView(ins, mp(-1, 40, 0, 0, 0, 0));
         body.addView(rowField("DNS", dnsDropdown()));
+        addInfoSection(P, null);
 
         addButtons(() -> {
-            String[] keys = {"uuid", "server", "connectIp", "port", "sni", "path", "transport", "insecure"};
+            String[] keys = {"uuid", "server", "connectIp", "port", "sni", "path", "transport", "insecure", "expiry", "message"};
             SharedPreferences.Editor e = prefs.edit();
             for (String k : keys) e.remove(P + "_" + k);
             e.apply();
@@ -847,6 +1580,8 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         body.addView(section("APP"));
         body.addView(settingRow("Auto Reconnect", toggle(prefs.getBoolean("autoReconnect", true),
                 (b, on) -> prefs.edit().putBoolean("autoReconnect", on).apply())));
+        body.addView(settingRow("Hide server in logs", toggle(prefs.getBoolean("hideHosts", true),
+                (b, on) -> prefs.edit().putBoolean("hideHosts", on).apply())));
         body.addView(settingRow("Theme", dropdown(new String[]{"Light", "Dark"}, prefs.getString("theme", "Light"), v -> {
             if (v.equals(prefs.getString("theme", "Light"))) return;
             prefs.edit().putString("theme", v).apply();
@@ -857,7 +1592,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         reset.setOnClickListener(v -> {
             boolean themeChanged = !"Light".equals(prefs.getString("theme", "Light"));
             prefs.edit().remove("dns").remove("logLevel").remove("verifyCerts").remove("allowInsecure")
-                    .remove("autoReconnect").remove("theme").apply();
+                    .remove("autoReconnect").remove("hideHosts").remove("theme").apply();
             Toast.makeText(this, "Settings reset", Toast.LENGTH_SHORT).show();
             if (themeChanged) recreate(); else show("settings");
         });
@@ -892,7 +1627,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         ProtocolConfig pc = new ProtocolConfig();
         pc.sshUser = p(P, "user", "").trim();
         pc.sshPassword = p(P, "pass", "");
-        pc.sshHost = "";   // [host] in the payload is the proxy host
+        pc.sshHost = p(P, "sshHost", DEFAULT_SERVER).trim();
         pc.sshPort = 22;
         pc.proxyHost = p(P, "proxyHost", "").trim();
         pc.tls = tlsOn(P);
@@ -900,7 +1635,6 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         pc.sni = p(P, "sni", "").trim();
         if (pc.sni.isEmpty()) pc.sni = pc.proxyHost;           // SNI defaults to the proxy host
         pc.payload = p(P, "payload", "");
-        pc.path = p(P, "path", "").trim();
         return pc;
     }
 
@@ -924,7 +1658,23 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         }
     }
 
+    /** Tells the log layer which server names to blank out (Settings > Hide server in logs). */
+    private void applyLogMask() {
+        List<String> hosts = new ArrayList<String>();
+        if ("SSH".equals(protocol)) {
+            hosts.add(p("SSH", "proxyHost", "").trim());
+            hosts.add(p("SSH", "sshHost", DEFAULT_SERVER).trim());
+            hosts.add(p("SSH", "sni", "").trim());
+        } else {
+            hosts.add(p(protocol, "server", "").trim());
+            hosts.add(p(protocol, "connectIp", "").trim());
+            hosts.add(p(protocol, "sni", "").trim());
+        }
+        TunnelState.setMask(prefs.getBoolean("hideHosts", true), hosts);
+    }
+
     private Intent buildIntent() {
+        applyLogMask();
         Intent intent = new Intent(this, TunnelVpnService.class);
         intent.setAction(TunnelVpnService.ACTION_START);
         intent.putExtra("dns", prefs.getString("dns", "8.8.8.8"));
@@ -941,7 +1691,6 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             intent.putExtra("payload", s.payload);
             intent.putExtra("proxyHost", s.proxyHost);
             intent.putExtra("proxyPort", s.proxyPort);
-            intent.putExtra("path", s.path);
             intent.putExtra("wsFrames", prefs.getBoolean("SSH_wsFrames", false));
         } else {
             intent.putExtra("uuid", p(protocol, "uuid", "").trim());
@@ -1178,16 +1927,22 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     @SuppressLint("ClickableViewAccessibility")
     private EditText payloadField() {
-        final String k = "SSH_payload";
+        return multilineField("SSH", "payload",
+                "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]", 130);
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private EditText multilineField(String P, String key, String hint, int minDp) {
+        final String k = P + "_" + key;
         final EditText e = new EditText(this);
-        e.setHint("GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]");
+        e.setHint(hint);
         e.setText(prefs.getString(k, ""));
         e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         e.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN);
         e.setSingleLine(false);
         e.setHorizontallyScrolling(false);
-        e.setMinHeight(dp(130));
+        e.setMinHeight(dp(minDp));
         e.setMaxLines(Integer.MAX_VALUE);
         e.setGravity(Gravity.TOP | Gravity.START);
         e.setTypeface(Typeface.MONOSPACE);
