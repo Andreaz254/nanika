@@ -168,9 +168,7 @@ public final class SshConnector implements UpstreamConnector, Closeable {
                 sess.disconnect();
                 throw new IOException("SSH tunnel is closed");
             }
-            HostKey hk = sess.getHostKey();
-            TunnelState.log("SSH: logged in" + (hk == null ? "" : " (server host key " + hk.getType() + " "
-                    + hk.getFingerPrint(jsch) + ")"));
+            TunnelState.log("SSH: logged in");
             return sess;
         } catch (JSchException e) {
             transport.close();
@@ -229,7 +227,7 @@ public final class SshConnector implements UpstreamConnector, Closeable {
         @Override public boolean promptPassword(String message) { return true; }
         @Override public boolean promptPassphrase(String message) { return false; }
         @Override public boolean promptYesNo(String message) { return true; }
-        @Override public void showMessage(String message) { }
+        @Override public void showMessage(String message) { TunnelState.logBanner(message); }
         @Override public String[] promptKeyboardInteractive(String dest, String name, String instruction,
                                                             String[] prompt, boolean[] echo) {
             String[] answers = new String[prompt == null ? 0 : prompt.length];
