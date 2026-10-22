@@ -38,6 +38,7 @@ import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.SocketFactory;
@@ -46,8 +47,11 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
 import okhttp3.Dispatcher;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
+import okhttp3.Request;
+import okhttp3.Response;
 
 /**
  * Data path:  apps -> TUN -> PacketEngine (user-space TCP) -> one VLESS/WebSocket per connection -> server
@@ -80,6 +84,7 @@ public class TunnelVpnService extends android.net.VpnService {
         String sshUser, sshPass, sshHost, payload, proxyHost;
         int sshPort = 22, proxyPort;
         boolean wsFrames;
+        boolean hideHosts = true;
         int port;
         boolean insecureTls;
         boolean tls = true;
@@ -121,7 +126,17 @@ public class TunnelVpnService extends android.net.VpnService {
         cfg.proxyHost = intent.getStringExtra("proxyHost");
         cfg.proxyPort = intent.getIntExtra("proxyPort", 0);
         cfg.wsFrames = intent.getBooleanExtra("wsFrames", false);
+        cfg.hideHosts = intent.getBooleanExtra("hideHosts", true);
         if (cfg.dns == null || cfg.dns.trim().isEmpty()) cfg.dns = "8.8.8.8";
+
+        // privacy: from here on the server's names / addresses are masked in every log line and error text
+        TunnelState.resetHidden(cfg.hideHosts);
+        TunnelState.hide(cfg.proxyHost);
+        TunnelState.hide(cfg.sshHost);
+        TunnelState.hide(cfg.sni);
+        TunnelState.hide(cfg.connectIp);
+        TunnelState.hide(cfg.hostHeader);
+        TunnelState.setBanner("");
 
         Thread t = new Thread(new Runnable() {
             @Override public void run() { connect(cfg); }
@@ -326,13 +341,35 @@ public class TunnelVpnService extends android.net.VpnService {
         Dispatcher d = new Dispatcher();               // each WebSocket occupies a dispatcher slot for its whole life
         d.setMaxRequests(1024);
         d.setMaxRequestsPerHost(1024);
+        final String urlHost = cfg.tls ? cfg.sni : cfg.hostHeader;     // the host name inside the WebSocket URL
+        final AtomicInteger okLogs = new AtomicInteger(), redirectLogs = new AtomicInteger(), errLogs = new AtomicInteger();
         OkHttpClient.Builder b = new OkHttpClient.Builder()
                 .dispatcher(d)
                 .protocols(Collections.singletonList(Protocol.HTTP_1_1))
                 .socketFactory(new ProtectingSocketFactory(this))
                 .dns(new okhttp3.Dns() {
                     @Override public java.util.List<InetAddress> lookup(String hostname) throws java.net.UnknownHostException {
-                        return Collections.singletonList(InetAddress.getByName(cfg.connectIp));
+                        // the configured host always goes to the Connect IP; a redirect to another host resolves normally
+                        if (urlHost == null || hostname.equalsIgnoreCase(urlHost)) {
+                            return Collections.singletonList(InetAddress.getByName(cfg.connectIp));
+                        }
+                        return okhttp3.Dns.SYSTEM.lookup(hostname);
+                    }
+                })
+                .addNetworkInterceptor(new Interceptor() {
+                    @Override public Response intercept(Chain chain) throws IOException {
+                        Request req = chain.request();
+                        String h = req.url().host();
+                        if (urlHost != null && !h.equalsIgnoreCase(urlHost)) {
+                            // redirected to another host: the Host header must follow it
+                            int p = req.url().port();
+                            boolean dflt = p == okhttp3.HttpUrl.defaultPort(req.url().scheme());
+                            req = req.newBuilder().header("Host", dflt ? h : h + ":" + p).build();
+                            TunnelState.hide(h);
+                        }
+                        Response r = chain.proceed(req);
+                        try { logReply(r, okLogs, redirectLogs, errLogs); } catch (RuntimeException ignored) { }
+                        return r;
                     }
                 })
                 .connectTimeout(10, TimeUnit.SECONDS)
@@ -354,6 +391,37 @@ public class TunnelVpnService extends android.net.VpnService {
             });
         }
         return b.build();
+    }
+
+    /**
+     * Logs the server's reply to the WebSocket upgrade: status line + the relevant headers only, and says so
+     * when it is a redirect (OkHttp then reconnects to the new address by itself). Rate limited, because
+     * every tunnelled connection opens its own WebSocket.
+     */
+    private static void logReply(Response r, AtomicInteger okLogs, AtomicInteger redirectLogs, AtomicInteger errLogs) {
+        int code = r.code();
+        boolean redirect = LogFilter.isRedirect(code);
+        if (redirect) {
+            if (redirectLogs.incrementAndGet() > 8) return;
+        } else if (code == 101) {
+            if (okLogs.incrementAndGet() > 1) return;
+        } else if (errLogs.incrementAndGet() > 6) {
+            return;
+        }
+        java.util.List<String[]> headers = new java.util.ArrayList<String[]>();
+        okhttp3.Headers hs = r.headers();
+        for (int i = 0; i < hs.size(); i++) headers.add(new String[]{hs.name(i), hs.value(i)});
+        String msg = r.message() == null ? "" : r.message();
+        LogFilter.logReply("Server reply: ", "HTTP/1.1 " + code + (msg.isEmpty() ? "" : " " + msg), headers);
+        if (redirect) {
+            LogFilter.Redirect rd = LogFilter.parseLocation(r.header("Location"));
+            if (rd != null && rd.host != null) {
+                TunnelState.hide(rd.host);
+                TunnelState.log("Redirect: reconnecting to " + rd.host + ":" + rd.port + (rd.tls ? " (TLS)" : " (plain)"));
+            } else {
+                TunnelState.log("Redirect: reconnecting to " + (rd == null ? "the new address" : rd.path));
+            }
+        }
     }
 
     private void readLoop() {
@@ -459,7 +527,7 @@ public class TunnelVpnService extends android.net.VpnService {
         PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
-                .setContentTitle("Nanika")
+                .setContentTitle("Bug Hunter VPN")
                 .setContentText(text)
                 .setContentIntent(pi)
                 .setOngoing(true)
