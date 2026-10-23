@@ -42,6 +42,8 @@ public final class SshPayload {
         public String proxyHost = "";
         public int proxyPort;
         public String wsKey = "";
+        public String method = "GET";
+        public String protocolVersion = "HTTP/1.1";
     }
 
     private SshPayload() {}
@@ -76,6 +78,8 @@ public final class SshPayload {
             else if (name.equals("proxy")) val = ctx.proxyHost;
             else if (name.equals("proxy_port")) val = String.valueOf(ctx.proxyPort);
             else if (name.equals("ws_key")) val = ctx.wsKey;
+            else if (name.equals("method")) val = ctx.method == null || ctx.method.isEmpty() ? "GET" : ctx.method;
+            else if (name.equals("protocol")) val = ctx.protocolVersion == null || ctx.protocolVersion.isEmpty() ? "HTTP/1.1" : ctx.protocolVersion;
             else if (name.equals("split")) val = String.valueOf(SPLIT);
             else val = m.group();                         // unknown token: keep it as typed
             sb.append(t, last, m.start()).append(val);

@@ -1,5 +1,6 @@
 package com.example.tunnel.ssh;
 
+import com.example.tunnel.LogFilter;
 import com.example.tunnel.TunnelState;
 import com.jcraft.jsch.Proxy;
 
@@ -13,6 +14,7 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.Charset;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
@@ -55,10 +57,7 @@ public final class SshWsTransport implements Proxy {
     private static final int SPLIT_DELAY_MS = 250;
     private static final int PEEK_MS = 700;
     private static final int MAX_HEAD = 8192;
-    private static final int MAX_REDIRECTS = 3;
-    /** Reply headers worth showing: everything else (cf-*, server-timing, report-to, nel, alt-svc ...) is noise. */
-    private static final java.util.Set<String> SHOWN_HEADERS = new java.util.HashSet<String>(
-            java.util.Arrays.asList("upgrade", "connection", "server", "date", "location"));
+    private static final int MAX_REDIRECTS = 4;
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Settings s;
@@ -70,31 +69,15 @@ public final class SshWsTransport implements Proxy {
 
     // ------------------------------------------------------------------ com.jcraft.jsch.Proxy
 
-    private String curHost, curSni;
-    private int curPort;
-    private boolean curTls;
-
-    /** The proxy answered 3xx with a Location: we reconnect there (same payload). */
-    private static final class Redirect extends IOException {
-        final int code;
-        final String location;
-        Redirect(int code, String location) {
-            super("redirect " + code);
-            this.code = code;
-            this.location = location;
-        }
-    }
-
     @Override
     public void connect(com.jcraft.jsch.SocketFactory jschFactory, String host, int port, int timeout) throws Exception {
         int to = timeout > 0 ? timeout : 20000;
         SocketFactory factory = s.socketFactory != null ? s.socketFactory : SocketFactory.getDefault();
-        curHost = s.proxyHost;
-        curPort = s.proxyPort;
-        curTls = s.tls;
-        curSni = s.sni;
-        int hops = 0;
-        while (true) {
+        String curHost = s.proxyHost;
+        int curPort = s.proxyPort;
+        boolean curTls = s.tls;
+        String curSni = s.sni;
+        for (int hop = 0; ; hop++) {
             Socket raw = factory.createSocket();
             socket = raw;
             try {
@@ -106,7 +89,7 @@ public final class SshWsTransport implements Proxy {
 
                 Socket sock = raw;
                 if (curTls) {
-                    sock = startTls(raw, to);
+                    sock = startTls(raw, to, curHost, curPort, curSni);
                     socket = sock;
                 }
                 sock.setSoTimeout(to);
@@ -116,7 +99,23 @@ public final class SshWsTransport implements Proxy {
                 sendPayload(rout);
 
                 PushbackInputStream pin = new PushbackInputStream(rin, 16);
-                readUpgradeReply(sock, pin);
+                LogFilter.Redirect redirect = readUpgradeReply(sock, pin);
+                if (redirect != null) {
+                    close();
+                    if (redirect.host == null) {
+                        throw new IOException("the proxy redirected to another path (" + redirect.path
+                                + ") - change the path in the payload");
+                    }
+                    if (hop >= MAX_REDIRECTS) throw new IOException("too many redirects (" + MAX_REDIRECTS + ")");
+                    curHost = redirect.host;
+                    curPort = redirect.port;
+                    curTls = redirect.tls;
+                    curSni = redirect.host;
+                    TunnelState.hide(curHost);
+                    TunnelState.log("Redirect: reconnecting to " + curHost + ":" + curPort
+                            + (curTls ? " (TLS)" : " (plain)") + "  [" + (hop + 1) + "/" + MAX_REDIRECTS + "]");
+                    continue;
+                }
                 sock.setSoTimeout(to);
 
                 if (s.wsFraming) {
@@ -128,60 +127,11 @@ public final class SshWsTransport implements Proxy {
                     in = pin;
                 }
                 return;
-            } catch (Redirect r) {
-                close();
-                if (++hops > MAX_REDIRECTS) throw new IOException("too many redirects (last: " + r.code + ")");
-                TunnelState.log("SSH: redirect " + r.code + " -> " + r.location + " - reconnecting (" + hops + "/" + MAX_REDIRECTS + ")");
-                applyRedirect(r.location);
             } catch (Exception e) {
                 close();
                 throw e;
             }
         }
-    }
-
-    /** Points the next attempt at the redirect target (absolute URL) or the same server (relative Location). */
-    private void applyRedirect(String location) {
-        String loc = location.trim();
-        String low = loc.toLowerCase(java.util.Locale.US);
-        int sep = low.indexOf("://");
-        if (sep < 0) return;                                   // relative path: same server, try again
-        String scheme = low.substring(0, sep);
-        if (!scheme.equals("http") && !scheme.equals("https") && !scheme.equals("ws") && !scheme.equals("wss")) return;
-        boolean tls = scheme.equals("https") || scheme.equals("wss");
-        String rest = loc.substring(sep + 3);
-        int end = rest.length();
-        for (char c : new char[]{'/', '?', '#'}) {
-            int i = rest.indexOf(c);
-            if (i >= 0 && i < end) end = i;
-        }
-        String auth = rest.substring(0, end);
-        int at = auth.lastIndexOf('@');
-        if (at >= 0) auth = auth.substring(at + 1);
-        String h = auth;
-        int p = tls ? 443 : 80;
-        if (auth.startsWith("[")) {
-            int close = auth.indexOf(']');
-            if (close > 0) {
-                h = auth.substring(1, close);
-                if (auth.length() > close + 2 && auth.charAt(close + 1) == ':') p = parsePort(auth.substring(close + 2), p);
-            }
-        } else {
-            int colon = auth.lastIndexOf(':');
-            if (colon > 0) {
-                h = auth.substring(0, colon);
-                p = parsePort(auth.substring(colon + 1), p);
-            }
-        }
-        if (h.isEmpty()) return;
-        curHost = h;
-        curPort = p;
-        curTls = tls;
-        curSni = tls ? h : "";
-    }
-
-    private static int parsePort(String v, int def) {
-        try { return Integer.parseInt(v.trim()); } catch (NumberFormatException e) { return def; }
     }
 
     @Override public InputStream getInputStream() { return in; }
@@ -200,8 +150,7 @@ public final class SshWsTransport implements Proxy {
 
     // ------------------------------------------------------------------ TLS (with SNI)
 
-    private Socket startTls(Socket raw, int timeout) throws Exception {
-        String sni = curSni;
+    private Socket startTls(Socket raw, int timeout, String proxyHost, int proxyPort, String sni) throws Exception {
         SSLContext ctx = SSLContext.getInstance("TLS");
         if (s.insecure) {
             ctx.init(null, new TrustManager[]{new X509TrustManager() {
@@ -212,7 +161,7 @@ public final class SshWsTransport implements Proxy {
         } else {
             ctx.init(null, null, null);
         }
-        SSLSocket ssl = (SSLSocket) ctx.getSocketFactory().createSocket(raw, sni, curPort, true);
+        SSLSocket ssl = (SSLSocket) ctx.getSocketFactory().createSocket(raw, sni, proxyPort, true);
         boolean engineVerifies = configureTls(ssl, sni, !s.insecure);
         ssl.setSoTimeout(timeout);
         try {
@@ -222,7 +171,7 @@ public final class SshWsTransport implements Proxy {
                 throw new SSLException("certificate does not match " + sni);
             }
         } catch (SSLException e) {
-            throw new IOException("TLS handshake with " + curHost + ":" + curPort + " (SNI " + sni + ") failed: "
+            throw new IOException("TLS handshake with " + proxyHost + ":" + proxyPort + " (SNI " + sni + ") failed: "
                     + e.getMessage() + (s.insecure ? "" : "  - if the certificate does not belong to the SNI host, "
                     + "tick 'Skip TLS certificate verification'"), e);
         }
@@ -284,10 +233,12 @@ public final class SshWsTransport implements Proxy {
 
     /**
      * Consumes the proxy's HTTP reply (101 Switching Protocols, 200 Connection established, ...), including
-     * several replies in a row. Anything that is not an HTTP reply (e.g. the "SSH-2.0-..." banner) is left in
-     * the stream for JSch.
+     * several replies in a row, and logs it: the status line plus only the relevant headers.
+     * Anything that is not an HTTP reply (e.g. the "SSH-2.0-..." banner) is left in the stream for JSch.
+     *
+     * @return the redirect target if the proxy answered with a 3xx + Location, otherwise null
      */
-    private void readUpgradeReply(Socket sock, PushbackInputStream in) throws IOException {
+    private LogFilter.Redirect readUpgradeReply(Socket sock, PushbackInputStream in) throws IOException {
         boolean first = true;
         while (true) {
             int old = sock.getSoTimeout();
@@ -311,30 +262,36 @@ public final class SshWsTransport implements Proxy {
             if (got > 0) in.unread(p, 0, got);
             if (got < 5 || timedOut || !"HTTP/".equals(new String(p, 0, 5, LATIN1))) {
                 if (first && got == 0) throw new IOException("the proxy closed the connection without replying");
-                return;                                       // SSH banner (or nothing yet) - not our business
+                return null;                                  // SSH banner (or nothing yet) - not our business
             }
             first = false;
 
             String head = readHead(in);
             String status = head.substring(0, indexOfEol(head));
-            TunnelState.log("SSH: proxy replied: " + status);
-            String location = null;
-            for (String hl : head.split("\\r?\\n")) {
-                int colon = hl.indexOf(':');
-                if (hl.isEmpty() || hl.equals(status) || colon <= 0) continue;
-                String name = hl.substring(0, colon).trim().toLowerCase(java.util.Locale.US);
-                String value = hl.substring(colon + 1).trim();
-                if (name.equals("location")) location = value;
-                if (SHOWN_HEADERS.contains(name)) TunnelState.log("SSH: < " + hl.trim());
-            }
+            List<String[]> headers = parseHeaders(head);
+            LogFilter.logReply("Server reply: ", status, headers);
             int code = statusCode(status);
-            if (code >= 300 && code < 400 && location != null && !location.isEmpty()) {
-                throw new Redirect(code, location);
+            if (LogFilter.isRedirect(code)) {
+                String loc = null;
+                for (String[] h : headers) if ("location".equalsIgnoreCase(h[0].trim())) loc = h[1];
+                LogFilter.Redirect r = LogFilter.parseLocation(loc);
+                if (r == null) throw new IOException("the proxy sent " + status + " without a usable Location");
+                return r;
             }
             if (code < 100 || code >= 300) {
                 throw new IOException("the proxy rejected the payload: " + status);
             }
         }
+    }
+
+    private static List<String[]> parseHeaders(String head) {
+        List<String[]> out = new ArrayList<String[]>();
+        String[] lines = head.split("\r?\n");
+        for (int i = 1; i < lines.length; i++) {
+            int c = lines[i].indexOf(':');
+            if (c > 0) out.add(new String[]{lines[i].substring(0, c), lines[i].substring(c + 1).trim()});
+        }
+        return out;
     }
 
     private static int indexOfEol(String head) {

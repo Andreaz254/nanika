@@ -6,7 +6,6 @@ import com.example.tunnel.engine.UpstreamListener;
 import com.example.tunnel.engine.UpstreamStream;
 import com.example.tunnel.protocol.ProtocolConfig;
 import com.jcraft.jsch.ChannelDirectTCPIP;
-import com.jcraft.jsch.HostKey;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
@@ -156,6 +155,7 @@ public final class SshConnector implements UpstreamConnector, Closeable {
             String host = cfg.sshHost != null && !cfg.sshHost.isEmpty() ? cfg.sshHost : cfg.proxyHost;
             Session sess = jsch.getSession(cfg.sshUser, host, cfg.sshPort);
             sess.setPassword(cfg.sshPassword);
+            TunnelState.setBanner("");
             sess.setUserInfo(new PasswordInfo(cfg.sshPassword));
             sess.setConfig("StrictHostKeyChecking", "no");        // there is no known_hosts on the phone
             sess.setConfig("PreferredAuthentications", "password,keyboard-interactive");
@@ -168,7 +168,8 @@ public final class SshConnector implements UpstreamConnector, Closeable {
                 sess.disconnect();
                 throw new IOException("SSH tunnel is closed");
             }
-            TunnelState.log("SSH: logged in");
+            String ver = sess.getServerVersion();
+            TunnelState.log("SSH: logged in" + (ver == null || ver.isEmpty() ? "" : "  -  server: " + ver));
             return sess;
         } catch (JSchException e) {
             transport.close();
@@ -227,7 +228,11 @@ public final class SshConnector implements UpstreamConnector, Closeable {
         @Override public boolean promptPassword(String message) { return true; }
         @Override public boolean promptPassphrase(String message) { return false; }
         @Override public boolean promptYesNo(String message) { return true; }
-        @Override public void showMessage(String message) { TunnelState.logBanner(message); }
+        @Override public void showMessage(String message) {
+            if (message == null || message.trim().isEmpty()) return;
+            TunnelState.setBanner(message);
+            TunnelState.log("SSH: server banner received");
+        }
         @Override public String[] promptKeyboardInteractive(String dest, String name, String instruction,
                                                             String[] prompt, boolean[] echo) {
             String[] answers = new String[prompt == null ? 0 : prompt.length];
