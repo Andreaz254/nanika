@@ -414,15 +414,9 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         menu.setOnClickListener(v -> openDrawer());
         pressable(menu, 0.88f);
         bar.addView(menu);
-        LinearLayout titleRow = row();
-        titleRow.setGravity(Gravity.CENTER_VERTICAL | Gravity.BOTTOM);
-        titleRow.setPadding(dp(18), 0, 0, 0);
         TextView title = text(getString(R.string.app_name), 20, TEXT, true);
-        titleRow.addView(title);
-        TextView ver = text("v" + getString(R.string.app_version), 11, MUTED, false);
-        ver.setPadding(dp(6), 0, 0, dp(2));
-        titleRow.addView(ver);
-        bar.addView(titleRow, new LinearLayout.LayoutParams(0, -2, 1));
+        title.setPadding(dp(18), 0, 0, 0);
+        bar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         FrameLayout dot = new FrameLayout(this);
         dotView = new View(this);
         FrameLayout.LayoutParams dp1 = new FrameLayout.LayoutParams(dp(14), dp(14));
@@ -1311,7 +1305,13 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     // ================================================================== forced update
 
     private void checkForUpdate() {
-        final String cur = getString(R.string.app_version);         // res/values/app_version.xml - bump per release
+        String current;
+        try {
+            current = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            current = "0";
+        }
+        final String cur = current == null ? "0" : current;
         new Thread(() -> UpdateManager.check(cur, new UpdateManager.CheckListener() {
             @Override public void onUpdateAvailable(UpdateManager.Info info) {
                 ui.post(() -> showUpdateDialog(info));
