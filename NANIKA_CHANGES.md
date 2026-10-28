@@ -118,21 +118,3 @@ Every protocol's three-dot menu (SSH explicitly requested; added to VLESS/VMess 
 also have no visible buttons) now has a "Reset" item that clears all of that protocol's stored settings,
 including any protection flags and HWID lock - this is the only way to get out of a fully locked ("Lock all")
 imported page, since that page shows nothing but the lock message.
-
-## Fix: update dialog looping on every launch
-
-The check now compares against a dedicated version file instead of the app's package `versionName`, which is
-easy to forget to bump before building a release - that's almost certainly why it looped (the installed APK
-kept reporting the same old version to the server no matter how many times you updated).
-
-* **`app/src/main/res/values/app_version.xml`** - the only thing the update check reads now:
-  ```xml
-  <string name="app_version">1.0</string>
-  ```
-  **Bump this to match the number in the filename every time you build a release**, e.g. before building
-  `nanika-v1.17.apk`, set it to `1.17`. If it doesn't match what you upload to `~/nanika-updates/releases/`,
-  the app will keep seeing "a newer version" is available and keep prompting - same as before.
-* If the file's version is equal to (or higher than) the server's, the check is skipped entirely - no
-  download, no dialog, nothing.
-* **Home page**: a small "v1.0" label now sits right next to the "Nanika" title, read from this same file, so
-  you can see at a glance which version is actually installed on the phone.
