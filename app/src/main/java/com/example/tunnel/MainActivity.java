@@ -70,6 +70,12 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import android.provider.Settings;
+import com.example.tunnel.share.ShareHotspot;
+import com.example.tunnel.share.ShareManager;
+import com.example.tunnel.share.ShareProxy;
+import com.example.tunnel.share.SpeedMonitor;
+import com.example.tunnel.ui.SpeedGraph;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
@@ -122,6 +128,19 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     private SharedPreferences prefs;
     private final Handler ui = new Handler(Looper.getMainLooper());
+
+    // Sharenet page state
+    private static final int PURPLE = Color.rgb(138, 77, 224);
+    private String shareTab = "setup";
+    private int shareAddrIdx;
+    private String shareAddrSig = "";
+    private Runnable shareTick;
+    private SpeedGraph graph;
+    private TextView shareStatus, liveDown, liveUp, liveStats, hotspotInfo;
+    private Button hotspotBtn;
+    private final Runnable applyShare = new Runnable() {
+        @Override public void run() { ShareManager.apply(); updateShareStatus(); }
+    };
     private String page = "home";
     private String protocol;
 
@@ -187,7 +206,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                     if (out == null) throw new java.io.IOException("cannot open the file");
                     out.write(data);
                     out.flush();
-                    toast("Configuration exported");
+                    toast("File saved");
                 } catch (Exception e) {
                     toast("Export failed: " + e.getMessage());
                 }
@@ -200,6 +219,12 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 Intent r = result.getData();
                 if (result.getResultCode() != RESULT_OK || r == null || r.getData() == null || proto == null) return;
                 importFromUri(proto, r.getData());
+            });
+
+    private final ActivityResultLauncher<String[]> hotspotPermission = registerForActivityResult(
+            new ActivityResultContracts.RequestMultiplePermissions(), r -> {
+                if (ShareHotspot.permissionsOk(this)) startHotspot();
+                else toast("The hotspot needs the Nearby devices / Location permission");
             });
 
     private final ActivityResultLauncher<String> notificationPermission = registerForActivityResult(
@@ -380,6 +405,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         drawerItem(0, GlyphDrawable.VLESS, "VLESS", "vless");
         drawerItem(0, GlyphDrawable.VMESS, "VMess", "vmess");
         drawerItem(R.drawable.ic_terminal, -1, "Logs", "logs");
+        drawerItem(R.drawable.ic_share, -1, "Sharenet", "share");
         View line = new View(this);
         line.setBackgroundColor(BORDER);
         drawer.addView(line, mp(-1, 1, 6, 14, 6, 14));
@@ -414,9 +440,15 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         menu.setOnClickListener(v -> openDrawer());
         pressable(menu, 0.88f);
         bar.addView(menu);
+        LinearLayout titleRow = row();
+        titleRow.setGravity(Gravity.CENTER_VERTICAL | Gravity.BOTTOM);
+        titleRow.setPadding(dp(18), 0, 0, 0);
         TextView title = text(getString(R.string.app_name), 20, TEXT, true);
-        title.setPadding(dp(18), 0, 0, 0);
-        bar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        titleRow.addView(title);
+        TextView ver = text("v" + getString(R.string.app_version), 11, MUTED, false);
+        ver.setPadding(dp(6), 0, 0, dp(2));
+        titleRow.addView(ver);
+        bar.addView(titleRow, new LinearLayout.LayoutParams(0, -2, 1));
         FrameLayout dot = new FrameLayout(this);
         dotView = new View(this);
         FrameLayout.LayoutParams dp1 = new FrameLayout.LayoutParams(dp(14), dp(14));
@@ -516,6 +548,9 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         } else if ("vmess".equals(target)) {
             toolbarHolder.addView(pageBar("VMess Configuration", v -> showConfigMenu(v, "VMess")));
             buildWsConfig("VMess");
+        } else if ("share".equals(target)) {
+            toolbarHolder.addView(pageBar("Sharenet", null));
+            buildShare();
         } else {
             toolbarHolder.addView(pageBar("Settings", null));
             buildSettings();
@@ -539,6 +574,9 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     }
 
     private void clearHomeRefs() {
+        if (shareTick != null) ui.removeCallbacks(shareTick);
+        shareTick = null;
+        graph = null; shareStatus = null; liveDown = null; liveUp = null; liveStats = null; hotspotInfo = null; hotspotBtn = null;
         connectBtn = null; statusIcon = null;
         statusText = null; dotView = null; dotSpinner = null; logView = null;
         noticeBox = null; bannerCard = null; bannerText = null; shownBanner = null;
@@ -887,6 +925,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             wasConnected = false;
         }
         refreshHome();
+        if ("share".equals(page)) updateShareStatus();
     }
 
     /** Auto Reconnect (Settings): after an unexpected drop, retry up to 3 times, 3 s apart. */
@@ -1027,6 +1066,388 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     }
 
     // ================================================================== Settings page
+
+
+    // ================================================================== Sharenet
+
+    private Button solidButton(String label) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setTextSize(13);
+        b.setTypeface(null, Typeface.BOLD);
+        b.setTextColor(Color.WHITE);
+        b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF), shape(ORANGE, 0, 0, 8), shape(Color.WHITE, 0, 0, 8)));
+        b.setStateListAnimator(null);
+        b.setElevation(dp(2));
+        pressable(b, 0.97f);
+        return b;
+    }
+
+    private TextView monoText(String t, int sp, int color) {
+        TextView v = text(t, sp, color, false);
+        v.setTypeface(Typeface.MONOSPACE);
+        v.setTextIsSelectable(true);
+        return v;
+    }
+
+    private LinearLayout card() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setBackground(shape(CARD, BORDER, 1, 12));
+        c.setElevation(dp(2));
+        c.setPadding(dp(14), dp(12), dp(14), dp(12));
+        return c;
+    }
+
+    private void copyText(String label, String value) {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText(label, value));
+        toast(label + " copied");
+    }
+
+    /** A text field that also restarts the proxy shortly after the user stops typing. */
+    private EditText shareField(String key, String hint, String def) {
+        EditText e = field("SHARE", key, hint, def);
+        e.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {
+                ui.removeCallbacks(applyShare);
+                ui.postDelayed(applyShare, 900);
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+        return e;
+    }
+
+    private void buildShare() {
+        SpeedMonitor.ensureRunning();
+        body.addView(segmented(new String[]{"SETUP", "LIVE SPEED"}, new String[]{"setup", "live"}, shareTab, v -> {
+            shareTab = v;
+            show("share");
+        }));
+        if ("live".equals(shareTab)) buildShareLive(); else buildShareSetup();
+        shareTick = new Runnable() {
+            @Override public void run() {
+                if (!"share".equals(page)) return;
+                updateShareLive();
+                updateShareStatus();
+                refreshShareAddresses();
+                ui.postDelayed(this, 1000);
+            }
+        };
+        ui.postDelayed(shareTick, 1000);
+        updateShareLive();
+        updateShareStatus();
+    }
+
+    // ------------------------------------------------------------------ setup tab
+
+    private ShareManager.Addr currentAddr(List<ShareManager.Addr> addrs) {
+        if (addrs.isEmpty()) return null;
+        return addrs.get(Math.min(shareAddrIdx, addrs.size() - 1));
+    }
+
+    private void buildShareSetup() {
+        final int port = ShareManager.port(this);
+        final boolean authOn = ShareManager.authOn(this);
+        final String user = ShareManager.user(this);
+        final String pass = ShareManager.password(this);        // creates a random one the first time
+        final List<ShareManager.Addr> addrs = ShareManager.addresses();
+        shareAddrSig = addrSig(addrs);
+        final ShareManager.Addr addr = currentAddr(addrs);
+
+        LinearLayout top = card();
+        LinearLayout sw = row();
+        sw.setGravity(Gravity.CENTER_VERTICAL);
+        sw.addView(text("Share this connection", 15, TEXT, true), new LinearLayout.LayoutParams(0, -2, 1));
+        sw.addView(toggle(ShareManager.enabled(this), (b, on) -> {
+            ShareManager.setEnabled(this, on);
+            updateShareStatus();
+        }));
+        top.addView(sw);
+        shareStatus = text("", 12, MUTED, false);
+        top.addView(shareStatus, mp(-1, -2, 0, 6, 0, 0));
+        body.addView(top, mp(-1, -2, 0, 4, 0, 0));
+        addTextNote("Other devices use this phone's tunnel through a proxy. It works while the VPN is connected.");
+
+        body.addView(section("PROXY"));
+        body.addView(rowField("Port", fieldSized(shareField("port", "8080", "8080"))));
+        body.addView(settingRow("Require login", toggle(authOn, (b, on) -> {
+            prefs.edit().putBoolean("SHARE_auth", on).apply();
+            ShareManager.apply();
+            show("share");
+        })));
+        if (authOn) {
+            body.addView(rowField("Username", fieldSized(shareField("user", "nanika", "nanika"))));
+            LinearLayout pr = rowField("Password", fieldSized(shareField("pass", "password", pass)));
+            body.addView(pr);
+            Button newPw = outlineButton("NEW RANDOM PASSWORD");
+            newPw.setOnClickListener(v -> {
+                prefs.edit().putString("SHARE_pass", ShareManager.randomPassword()).apply();
+                ShareManager.apply();
+                show("share");
+            });
+            body.addView(newPw, mp(-1, 40, 0, 6, 0, 0));
+        } else {
+            TextView warn = text("Without a login, anyone on the same network can use your tunnel.", 12, RED, false);
+            warn.setPadding(0, dp(4), 0, 0);
+            body.addView(warn);
+        }
+        addTextNote("HTTP and SOCKS5 share the same port. Only TCP traffic (web, apps) is shared, not UDP calls or IPv6.");
+
+        body.addView(section("ADDRESS FOR OTHER DEVICES"));
+        if (addrs.isEmpty()) {
+            addTextNote("No Wi-Fi or hotspot address found. Join a Wi-Fi network, or start the hotspot below.");
+        } else {
+            if (addrs.size() > 1) {
+                String[] names = new String[addrs.size()];
+                for (int i = 0; i < names.length; i++) names[i] = addrs.get(i).label + "  " + addrs.get(i).ip;
+                body.addView(dropdown(names, names[Math.min(shareAddrIdx, names.length - 1)], v -> {
+                    for (int i = 0; i < names.length; i++) if (names[i].equals(v)) shareAddrIdx = i;
+                    show("share");
+                }));
+            }
+            final String hp = addr.ip + ":" + port;
+            LinearLayout ar = card();
+            LinearLayout line = row();
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout col = new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            col.addView(text(addr.label + "  \u2022  HTTP / SOCKS5 proxy", 12, MUTED, false));
+            col.addView(monoText(hp, 17, TEXT));
+            line.addView(col, new LinearLayout.LayoutParams(0, -2, 1));
+            ImageView cp = icon(R.drawable.ic_copy, 20, ORANGE);
+            cp.setPadding(dp(4), dp(4), dp(4), dp(4));
+            cp.setOnClickListener(v -> copyText("Proxy address", hp));
+            line.addView(cp, new LinearLayout.LayoutParams(dp(32), dp(32)));
+            ar.addView(line);
+            if (authOn) ar.addView(monoText("login: " + user + " / " + pass, 12, MUTED), mp(-1, -2, 0, 6, 0, 0));
+            body.addView(ar, mp(-1, -2, 0, 4, 0, 0));
+        }
+
+        body.addView(section("PAC FILE (AUTO PROXY)"));
+        if (addr == null) {
+            addTextNote("The PAC address appears here once the phone has a Wi-Fi or hotspot address.");
+        } else {
+            final String pacUrl = "http://" + addr.ip + ":" + port + "/proxy.pac";
+            LinearLayout pc = card();
+            pc.addView(monoText(pacUrl, 13, TEXT));
+            LinearLayout br = row();
+            Button copyUrl = outlineButton("COPY URL");
+            copyUrl.setOnClickListener(v -> copyText("PAC URL", pacUrl));
+            Button save = outlineButton("SAVE .PAC FILE");
+            save.setOnClickListener(v -> savePac(addr.ip + ":" + port));
+            br.addView(copyUrl, mp(0, 40, 0, 0, 6, 0, 1));
+            br.addView(save, mp(0, 40, 0, 0, 0, 0, 1));
+            pc.addView(br, mp(-1, -2, 0, 10, 0, 0));
+            body.addView(pc, mp(-1, -2, 0, 4, 0, 0));
+            addTextNote("The URL works while sharing is on and the VPN is connected. Local addresses go direct, everything else through the proxy.");
+        }
+
+        body.addView(section("NANIKA HOTSPOT"));
+        LinearLayout hc = card();
+        hotspotInfo = text("", 12, TEXT, false);
+        hotspotInfo.setTypeface(Typeface.MONOSPACE);
+        hotspotInfo.setTextIsSelectable(true);
+        hc.addView(hotspotInfo);
+        hotspotBtn = solidButton("START HOTSPOT");
+        hotspotBtn.setOnClickListener(v -> {
+            if (ShareHotspot.running()) {
+                ShareHotspot.stop(this::onHotspotChanged);
+            } else if (!ShareHotspot.permissionsOk(this)) {
+                hotspotPermission.launch(ShareHotspot.neededPermissions());
+            } else {
+                startHotspot();
+            }
+        });
+        hc.addView(hotspotBtn, mp(-1, 44, 0, 10, 0, 0));
+        Button sys = outlineButton("OPEN PHONE HOTSPOT SETTINGS");
+        sys.setOnClickListener(v -> openHotspotSettings());
+        hc.addView(sys, mp(-1, 40, 0, 8, 0, 0));
+        body.addView(hc, mp(-1, -2, 0, 4, 0, 0));
+        addTextNote("Android picks the name and password of a hotspot an app creates, so it cannot be called \"Nanika WiFi\". "
+                + "To get that name, use the phone's own hotspot (button above) and rename it. The app's hotspot has no internet of its own: "
+                + "devices on it must use the proxy.");
+        updateHotspotViews();
+
+        body.addView(section("HOW TO CONNECT"));
+        String hp = addr == null ? "PHONE-IP:" + port : addr.ip + ":" + port;
+        String pac = addr == null ? "http://PHONE-IP:" + port + "/proxy.pac" : "http://" + addr.ip + ":" + port + "/proxy.pac";
+        StringBuilder st = new StringBuilder();
+        st.append("1. Turn on \"Share this connection\" above and connect the VPN on this phone.\n")
+          .append("2. Put the other device on the same Wi-Fi as this phone, or on the hotspot above.\n")
+          .append("3. On that device set the proxy to ").append(hp).append(":\n\n")
+          .append("Android: Settings > Wi-Fi > the network > Modify > Advanced > Proxy > Manual (host and port), or Proxy Auto-Config with ").append(pac).append("\n\n")
+          .append("iPhone / iPad: Settings > Wi-Fi > (i) > Configure Proxy > Manual (server and port), or Automatic with the PAC URL.\n\n")
+          .append("Windows: Settings > Network & Internet > Proxy > Use a setup script (PAC URL), or Manual proxy setup.\n\n")
+          .append("Mac: System Settings > Wi-Fi > Details > Proxies > Automatic Proxy Configuration, or Web Proxy / SOCKS Proxy.\n\n")
+          .append("Firefox, Telegram and other apps with proxy settings: choose SOCKS5, host and port.\n\n");
+        if (authOn) st.append("When asked for a login use ").append(user).append(" and the password above.\n\n");
+        st.append("4. Open a website to test. The Live speed tab shows the traffic.");
+        LinearLayout sc = card();
+        TextView stepText = text(st.toString(), 12, TEXT, false);
+        stepText.setTextIsSelectable(true);
+        sc.addView(stepText);
+        body.addView(sc, mp(-1, -2, 0, 4, 0, 14));
+    }
+
+    private String addrSig(List<ShareManager.Addr> a) {
+        StringBuilder sb = new StringBuilder();
+        for (ShareManager.Addr x : a) sb.append(x.label).append(x.ip).append(';');
+        return sb.toString();
+    }
+
+    /** Rebuilds the page when the phone's addresses change (hotspot started, Wi-Fi joined), but never while typing. */
+    private void refreshShareAddresses() {
+        if (!"setup".equals(shareTab)) return;
+        String sig = addrSig(ShareManager.addresses());
+        if (sig.equals(shareAddrSig)) return;
+        View f = getCurrentFocus();
+        if (f instanceof EditText) return;
+        show("share");
+    }
+
+    private void savePac(String hostPort) {
+        pendingExportData = ShareProxy.pac(hostPort).getBytes(java.nio.charset.Charset.forName("UTF-8"));
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/x-ns-proxy-autoconfig");
+        i.putExtra(Intent.EXTRA_TITLE, "nanika.pac");
+        try {
+            exportLauncher.launch(i);
+        } catch (RuntimeException e) {
+            pendingExportData = null;
+            toast("No file picker available on this device");
+        }
+    }
+
+    private void startHotspot() {
+        ShareHotspot.start(this, this::onHotspotChanged);
+        updateHotspotViews();
+    }
+
+    private void onHotspotChanged() {
+        if (ShareHotspot.running() && !ShareManager.enabled(this)) {
+            ShareManager.setEnabled(this, true);                 // the hotspot has no internet: the proxy is the point
+            toast("Sharing turned on for the hotspot");
+        }
+        if ("share".equals(page)) {
+            updateHotspotViews();
+            updateShareStatus();
+            if ("setup".equals(shareTab)) {
+                View f = getCurrentFocus();
+                if (!(f instanceof EditText)) show("share");
+            }
+        }
+    }
+
+    private void updateHotspotViews() {
+        if (hotspotInfo == null || hotspotBtn == null) return;
+        if (ShareHotspot.running()) {
+            hotspotInfo.setText("Network:  " + ShareHotspot.ssid + "\nPassword: " + ShareHotspot.pass
+                    + "\n\nJoin it from the other device, then set the proxy below.");
+            hotspotBtn.setText("STOP HOTSPOT");
+        } else if (ShareHotspot.starting) {
+            hotspotInfo.setText("Starting the hotspot...");
+            hotspotBtn.setText("STARTING...");
+        } else {
+            hotspotInfo.setText(ShareHotspot.error.isEmpty() ? "Off" : "Could not start: " + ShareHotspot.error);
+            hotspotBtn.setText("START HOTSPOT");
+        }
+    }
+
+    private void openHotspotSettings() {
+        try {
+            startActivity(new Intent("android.settings.TETHER_SETTINGS"));
+        } catch (RuntimeException e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_WIRELESS_SETTINGS));
+            } catch (RuntimeException e2) {
+                toast("Open Settings > Network > Hotspot yourself");
+            }
+        }
+    }
+
+    private void updateShareStatus() {
+        if (shareStatus == null) return;
+        boolean en = ShareManager.enabled(this);
+        boolean up = TunnelState.state() == TunnelState.State.CONNECTED;
+        if (!en) {
+            shareStatus.setText("Off");
+            shareStatus.setTextColor(MUTED);
+        } else if (!up) {
+            shareStatus.setText("On  -  waiting for the VPN to connect");
+            shareStatus.setTextColor(ORANGE);
+        } else if (ShareManager.running()) {
+            int n = ShareManager.clients();
+            shareStatus.setText("Running on port " + ShareManager.port(this) + "  -  " + n + (n == 1 ? " device" : " devices")
+                    + ", " + ShareManager.connections() + " connections");
+            shareStatus.setTextColor(GREEN);
+        } else {
+            String e = ShareManager.error();
+            shareStatus.setText(e.isEmpty() ? "Starting..." : "Could not start: " + e);
+            shareStatus.setTextColor(e.isEmpty() ? MUTED : RED);
+        }
+    }
+
+    // ------------------------------------------------------------------ live speed tab
+
+    private void buildShareLive() {
+        LinearLayout reads = row();
+        LinearLayout d = new LinearLayout(this);
+        d.setOrientation(LinearLayout.VERTICAL);
+        d.addView(text("\u2193  DOWNLOAD", 11, MUTED, true));
+        liveDown = text("0 B/s", 22, ORANGE, true);
+        d.addView(liveDown);
+        LinearLayout u = new LinearLayout(this);
+        u.setOrientation(LinearLayout.VERTICAL);
+        u.addView(text("\u2191  UPLOAD", 11, MUTED, true));
+        liveUp = text("0 B/s", 22, PURPLE, true);
+        u.addView(liveUp);
+        reads.addView(d, new LinearLayout.LayoutParams(0, -2, 1));
+        reads.addView(u, new LinearLayout.LayoutParams(0, -2, 1));
+        body.addView(reads, mp(-1, -2, 4, 6, 0, 8));
+
+        LinearLayout gc = card();
+        gc.setPadding(dp(8), dp(10), dp(8), dp(6));
+        graph = new SpeedGraph(this);
+        graph.setColors(ORANGE, PURPLE, 0x33808080, MUTED);
+        gc.addView(graph, new LinearLayout.LayoutParams(-1, dp(200)));
+        body.addView(gc);
+
+        body.addView(section("DETAILS"));
+        LinearLayout sc = card();
+        liveStats = text("", 12, TEXT, false);
+        liveStats.setTypeface(Typeface.MONOSPACE);
+        sc.addView(liveStats);
+        body.addView(sc, mp(-1, -2, 0, 4, 0, 0));
+        Button reset = outlineButton("RESET COUNTERS");
+        reset.setOnClickListener(v -> { SpeedMonitor.reset(); updateShareLive(); });
+        body.addView(reset, mp(-1, 42, 0, 12, 0, 12));
+        addTextNote("Orange = download, purple = upload. Numbers combine this phone's apps and the devices using Sharenet.");
+    }
+
+    private void updateShareLive() {
+        if (liveStats == null || graph == null) return;
+        SpeedMonitor.Snapshot s = SpeedMonitor.snapshot();
+        graph.setData(s.down, s.up);
+        liveDown.setText(SpeedMonitor.speed(s.nowDown));
+        liveUp.setText(SpeedMonitor.speed(s.nowUp));
+        float sd = s.shareDown.length > 0 ? s.shareDown[s.shareDown.length - 1] : 0;
+        float su = s.shareUp.length > 0 ? s.shareUp[s.shareUp.length - 1] : 0;
+        String a = "\u2193 ", b = "  \u2191 ";
+        StringBuilder t = new StringBuilder();
+        t.append("This phone\n  now   ").append(a).append(SpeedMonitor.speed(Math.max(0, s.nowDown - sd)))
+                .append(b).append(SpeedMonitor.speed(Math.max(0, s.nowUp - su)))
+                .append("\n  total ").append(a).append(SpeedMonitor.size(s.vpnDown)).append(b).append(SpeedMonitor.size(s.vpnUp))
+                .append("\n\nShared devices\n  now   ").append(a).append(SpeedMonitor.speed(sd)).append(b).append(SpeedMonitor.speed(su))
+                .append("\n  total ").append(a).append(SpeedMonitor.size(s.shareTotalDown)).append(b).append(SpeedMonitor.size(s.shareTotalUp))
+                .append("\n  ").append(ShareManager.clients()).append(" device(s), ").append(ShareManager.connections()).append(" connection(s)")
+                .append("\n\nPeak\n  ").append(a).append(SpeedMonitor.speed(s.peakDown)).append(b).append(SpeedMonitor.speed(s.peakUp))
+                .append("\n\nTotal since connected\n  ").append(a).append(SpeedMonitor.size(s.totalDown)).append(b).append(SpeedMonitor.size(s.totalUp));
+        liveStats.setText(t.toString());
+    }
 
     private void buildSettings() {
         body.addView(section("DEVICE"));
@@ -1305,13 +1726,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     // ================================================================== forced update
 
     private void checkForUpdate() {
-        String current;
-        try {
-            current = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-        } catch (Exception e) {
-            current = "0";
-        }
-        final String cur = current == null ? "0" : current;
+        final String cur = getString(R.string.app_version);         // res/values/app_version.xml - bump per release
         new Thread(() -> UpdateManager.check(cur, new UpdateManager.CheckListener() {
             @Override public void onUpdateAvailable(UpdateManager.Info info) {
                 ui.post(() -> showUpdateDialog(info));

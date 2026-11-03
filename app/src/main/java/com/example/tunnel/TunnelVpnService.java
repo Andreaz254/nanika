@@ -220,7 +220,10 @@ public class TunnelVpnService extends android.net.VpnService {
             ec.dnsUpstream = cfg.dns;
             final FileOutputStream out = new FileOutputStream(pfd.getFileDescriptor());
             PacketEngine eng = new PacketEngine(new PacketSink() {
-                @Override public void write(byte[] b, int off, int len) throws IOException { out.write(b, off, len); }
+                @Override public void write(byte[] b, int off, int len) throws IOException {
+                    out.write(b, off, len);
+                    com.example.tunnel.share.SpeedMonitor.vpnDown.addAndGet(len);
+                }
             }, connector, ec, new PacketEngine.Logger() {
                 @Override public void log(String m) { TunnelState.log(m); }
             });
@@ -238,6 +241,7 @@ public class TunnelVpnService extends android.net.VpnService {
                 }, "tun-reader");
                 readerThread.start();
             }
+            com.example.tunnel.share.ShareManager.tunnelUp(this, connector, cfg.dns);
             updateNotification("Connected");
             TunnelState.set(TunnelState.State.CONNECTED, "Connected");
             TunnelState.log("VPN is up. Apps are now routed through "
@@ -450,7 +454,10 @@ public class TunnelVpnService extends android.net.VpnService {
                 if ((pfds[0].revents & OsConstants.POLLIN) != 0) {
                     int n = in.read(buf);                 // the TUN fd may be non-blocking: 0 just means "nothing yet"
                     if (n < 0) { endReason = "TUN closed"; break; }
-                    if (n > 0) eng.onPacket(buf, n);
+                    if (n > 0) {
+                        com.example.tunnel.share.SpeedMonitor.vpnUp.addAndGet(n);
+                        eng.onPacket(buf, n);
+                    }
                 } else if ((pfds[0].revents & (OsConstants.POLLERR | OsConstants.POLLHUP | OsConstants.POLLNVAL)) != 0) {
                     endReason = "TUN device went away";
                     break;
@@ -476,6 +483,7 @@ public class TunnelVpnService extends android.net.VpnService {
             readerThread = null; engine = null; tun = null; client = null;
         }
         TunnelState.set(TunnelState.State.DISCONNECTING, "Disconnecting");
+        com.example.tunnel.share.ShareManager.tunnelDown();
         if (eng != null) eng.shutdown();
         closeConnector();
         if (reader != null && reader != Thread.currentThread()) {
