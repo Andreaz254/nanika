@@ -3,5 +3,5 @@
     <!-- The single source of truth for update checks (compared against the server's "version").
          Bump THIS every time you build a release that you upload as nanika-v<version>.apk -
          forgetting to bump it is what causes the update dialog to loop. -->
-    <string name="app_version">1.0</string>
+    <string name="app_version">1.2</string>
 </resources>
