@@ -118,3 +118,39 @@ Every protocol's three-dot menu (SSH explicitly requested; added to VLESS/VMess 
 also have no visible buttons) now has a "Reset" item that clears all of that protocol's stored settings,
 including any protection flags and HWID lock - this is the only way to get out of a fully locked ("Lock all")
 imported page, since that page shows nothing but the lock message.
+
+## Fix: update dialog looping on every launch
+
+The check now compares against a dedicated version file instead of the app's package `versionName`, which is
+easy to forget to bump before building a release - that's almost certainly why it looped (the installed APK
+kept reporting the same old version to the server no matter how many times you updated).
+
+* **`app/src/main/res/values/app_version.xml`** - the only thing the update check reads now:
+  ```xml
+  <string name="app_version">1.0</string>
+  ```
+  **Bump this to match the number in the filename every time you build a release**, e.g. before building
+  `nanika-v1.17.apk`, set it to `1.17`. If it doesn't match what you upload to `~/nanika-updates/releases/`,
+  the app will keep seeing "a newer version" is available and keep prompting - same as before.
+* If the file's version is equal to (or higher than) the server's, the check is skipped entirely - no
+  download, no dialog, nothing.
+* **Home page**: a small "v1.0" label now sits right next to the "Nanika" title, read from this same file, so
+  you can see at a glance which version is actually installed on the phone.
+
+## Sharenet + icon fix
+
+* **Icon:** `python tools/make_icons.py images.jpg` was run, so the launcher icons (square, round, adaptive) and the
+  drawer logo are now the Nanika picture instead of the placeholder fox.
+* **Sharenet (drawer > Sharenet):** other devices on the same Wi-Fi / hotspot use this phone's tunnel through a proxy.
+  * `share/ShareProxy` - one port, HTTP proxy + SOCKS5 + `/proxy.pac`. Every connection is opened THROUGH the tunnel
+    (`UpstreamConnector`), names are resolved through the tunnel too. The app itself is excluded from the VPN, so a
+    normal socket would have bypassed the tunnel; this is why the proxy talks to the connector directly.
+  * Login (SOCKS5 user/password, HTTP Basic) is ON by default with a random password.
+  * `share/ShareManager` starts the proxy when sharing is on AND the tunnel is connected, stops it on disconnect.
+  * `share/ShareHotspot` - local-only hotspot (Android 8+). Android chooses its name/password; the page shows them.
+    A hotspot called "Nanika WiFi" can only be made with the phone's own hotspot settings (button on the page).
+  * `share/SpeedMonitor` + `ui/SpeedGraph` - live download/upload graph (last 90 s), peaks, totals, shared-device counts.
+    Counters: TUN device (this phone) and the proxy (shared devices).
+  * Only TCP is shared (no UDP, no IPv6), like the tunnel itself.
+* Manifest: `ACCESS_WIFI_STATE`, `CHANGE_WIFI_STATE`, `ACCESS_FINE_LOCATION` (Android 12 and older),
+  `NEARBY_WIFI_DEVICES` (Android 13+), used only for the hotspot.
