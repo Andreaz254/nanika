@@ -71,6 +71,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import android.provider.Settings;
+import com.example.tunnel.servers.ServerList;
 import com.example.tunnel.share.ShareHotspot;
 import com.example.tunnel.share.ShareManager;
 import com.example.tunnel.share.ShareProxy;
@@ -128,6 +129,10 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     private SharedPreferences prefs;
     private final Handler ui = new Handler(Looper.getMainLooper());
+
+    // server list (servers.freessh.indevs.in)
+    private List<ServerList.Server> servers;       // null = never fetched on this install
+    private Button serverBtn;
 
     // Sharenet page state
     private static final int PURPLE = Color.rgb(138, 77, 224);
@@ -237,6 +242,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("dark_custom_settings", MODE_PRIVATE);
         protocol = prefs.getString("protocol", "SSH");
+        servers = ServerList.load(prefs);
         applyTheme();
         buildShell();
         show("home");
@@ -360,6 +366,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         root.addView(drawer, new FrameLayout.LayoutParams(dp(290), -1));
         setContentView(root);
         checkForUpdate();
+        fetchServers(false);
     }
 
     private void openDrawer() {
@@ -406,6 +413,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         drawerItem(0, GlyphDrawable.VMESS, "VMess", "vmess");
         drawerItem(R.drawable.ic_terminal, -1, "Logs", "logs");
         drawerItem(R.drawable.ic_share, -1, "Sharenet", "share");
+        drawerItem(R.drawable.ic_server, -1, "Choose server", "servers");
         View line = new View(this);
         line.setBackgroundColor(BORDER);
         drawer.addView(line, mp(-1, 1, 6, 14, 6, 14));
@@ -424,6 +432,10 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         item.addView(t);
         item.setOnClickListener(v -> {
             closeDrawer();
+            if (target.equals("servers")) {
+                showServerPicker();
+                return;
+            }
             if (target.equals("ssh")) selectProtocol("SSH");
             else if (target.equals("vless")) selectProtocol("VLESS");
             else if (target.equals("vmess")) selectProtocol("VMess");
@@ -457,15 +469,15 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         dotSpinner = icon(R.drawable.ic_spinner, 20, ORANGE);
         dot.addView(dotSpinner, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
         bar.addView(dot, new LinearLayout.LayoutParams(dp(24), dp(24)));
-        TextView logsBtn = text("LOGS", 12, Color.WHITE, true);
-        logsBtn.setLetterSpacing(0.08f);
-        logsBtn.setGravity(Gravity.CENTER);
-        logsBtn.setPadding(dp(14), 0, dp(14), 0);
-        logsBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF),
+        TextView importBtn = text("IMPORT", 12, Color.WHITE, true);
+        importBtn.setLetterSpacing(0.08f);
+        importBtn.setGravity(Gravity.CENTER);
+        importBtn.setPadding(dp(14), 0, dp(14), 0);
+        importBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF),
                 shape(ORANGE, 0, 0, 4), shape(Color.WHITE, 0, 0, 4)));
-        logsBtn.setOnClickListener(v -> show("logs"));
-        pressable(logsBtn, 0.92f);
-        bar.addView(logsBtn, mp(-2, 32, 12, 0, 0, 0));
+        importBtn.setOnClickListener(v -> showImportMenu());
+        pressable(importBtn, 0.92f);
+        bar.addView(importBtn, mp(-2, 32, 12, 0, 0, 0));
         return bar;
     }
 
@@ -577,6 +589,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         if (shareTick != null) ui.removeCallbacks(shareTick);
         shareTick = null;
         graph = null; shareStatus = null; liveDown = null; liveUp = null; liveStats = null; hotspotInfo = null; hotspotBtn = null;
+        serverBtn = null;
         connectBtn = null; statusIcon = null;
         statusText = null; dotView = null; dotSpinner = null; logView = null;
         noticeBox = null; bannerCard = null; bannerText = null; shownBanner = null;
@@ -601,6 +614,8 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         }
         protocol = p;
         prefs.edit().putString("protocol", p).apply();
+        reconcileServer(true);
+        refreshServerButton();
     }
 
     // ================================================================== HOME
@@ -608,10 +623,25 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     private void buildHome() {
         connectBtn = new ConnectButton(this, CARD, SOFT);
         connectBtn.setOnClickListener(v -> onButton());
-        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(dp(200), dp(200));
-        hp.gravity = Gravity.CENTER_HORIZONTAL;
+        FrameLayout hero = new FrameLayout(this);
+        hero.setClipChildren(false);
+        hero.addView(connectBtn, new FrameLayout.LayoutParams(dp(200), dp(200), Gravity.CENTER));
+        TextView logsChip = text("LOGS", 11, Color.WHITE, true);
+        logsChip.setLetterSpacing(0.08f);
+        logsChip.setGravity(Gravity.CENTER);
+        logsChip.setPadding(dp(12), 0, dp(12), 0);
+        logsChip.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF),
+                shape(ORANGE, 0, 0, 4), shape(Color.WHITE, 0, 0, 4)));
+        logsChip.setElevation(dp(3));
+        logsChip.setOnClickListener(v -> show("logs"));
+        pressable(logsChip, 0.92f);
+        FrameLayout.LayoutParams lcp = new FrameLayout.LayoutParams(-2, dp(28), Gravity.BOTTOM | Gravity.END);
+        lcp.rightMargin = (dp(23));          // about 4 o'clock on the circle; the circle itself does not move
+        lcp.bottomMargin = (dp(0));
+        hero.addView(logsChip, lcp);
+        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, dp(200));
         hp.topMargin = dp(8);
-        body.addView(connectBtn, hp);
+        body.addView(hero, hp);
 
         LinearLayout status = row();
         status.setGravity(Gravity.CENTER);
@@ -658,6 +688,11 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             cards.addView(cell, mp(0, 88, i == 0 ? 0 : 5, 0, i == 2 ? 0 : 5, 0, 1));
         }
         body.addView(cards);
+
+        serverBtn = outlineButton("Choose server");
+        serverBtn.setOnClickListener(v -> showServerPicker());
+        body.addView(serverBtn, mp(-1, 46, 0, 14, 0, 0));
+        refreshServerButton();
 
         noticeBox = new LinearLayout(this);
         noticeBox.setOrientation(LinearLayout.VERTICAL);
@@ -1067,6 +1102,246 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     // ================================================================== Settings page
 
+
+
+    // ================================================================== Import button (home) + server picker
+
+    private static String detectProto(JSONObject root) {
+        String t = root.optString("type", "");
+        if (t.equalsIgnoreCase("ssh")) return "SSH";
+        if (t.equalsIgnoreCase("vless")) return "VLESS";
+        if (t.equalsIgnoreCase("vmess")) return "VMess";
+        return null;
+    }
+
+    /** After a config was imported: it brings its own server, so no listed server stays chosen. */
+    private void afterImport(String proto, boolean fromHome) {
+        clearServerSelection();
+        if (fromHome) {
+            if (!busy()) {
+                protocol = proto;
+                prefs.edit().putString("protocol", proto).apply();
+            } else {
+                toast("Stop the VPN to switch to the imported " + proto + " configuration");
+            }
+            show("home");
+        } else {
+            show(proto.toLowerCase(Locale.US));
+        }
+    }
+
+    private void showImportMenu() {
+        choose("Import configuration", new String[]{"From clipboard", "From file (.anika or .json)"}, new Runnable[]{
+                this::importAutoClipboard,
+                () -> pickImportFile("AUTO")});
+    }
+
+    /** A vless:// or vmess:// link, or a Nanika JSON, from the clipboard: the protocol is detected from the content. */
+    private void importAutoClipboard() {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        String text = "";
+        if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null && cm.getPrimaryClip().getItemCount() > 0) {
+            CharSequence cs = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
+            if (cs != null) text = cs.toString();
+        }
+        String t = text.trim();
+        String low = t.toLowerCase(Locale.US);
+        String proto;
+        String err;
+        if (low.startsWith("vless://")) {
+            proto = "VLESS";
+            err = ConfigIO.importLink(prefs, proto, t);
+        } else if (low.startsWith("vmess://")) {
+            proto = "VMess";
+            err = ConfigIO.importLink(prefs, proto, t);
+        } else if (t.startsWith("{")) {
+            try {
+                JSONObject root = ConfigIO.parseFile(t.getBytes(java.nio.charset.Charset.forName("UTF-8")));
+                proto = detectProto(root);
+                if (proto == null) {
+                    toast("Import failed: this is not a Nanika configuration");
+                    return;
+                }
+                err = ConfigIO.fromJson(prefs, proto, root, HwId.get(this));
+            } catch (Exception e) {
+                toast("Import failed: " + e.getMessage());
+                return;
+            }
+        } else {
+            toast("Nothing to import: copy a vless:// or vmess:// link or a Nanika config first");
+            return;
+        }
+        if (err != null) {
+            toast("Import failed: " + err);
+            return;
+        }
+        toast(proto + " configuration imported");
+        afterImport(proto, true);
+    }
+
+    // ------------------------------------------------------------------ servers
+
+    private void fetchServers(final boolean verbose) {
+        ServerList.fetch(this, prefs, list -> {
+            if (isFinishing()) return;
+            servers = list;
+            reconcileServer(false);
+            refreshServerButton();
+            if (verbose) toast("Server list updated (" + list.size() + ")");
+        });
+    }
+
+    private ServerList.Server findServer(String name) {
+        if (servers == null) return null;
+        for (ServerList.Server s : servers) if (s.name.equals(name)) return s;
+        return null;
+    }
+
+    private String chosenServerName() {
+        return prefs.getString("server_selected", "");
+    }
+
+    private void clearServerSelection() {
+        prefs.edit().remove("server_selected").apply();
+        refreshServerButton();
+    }
+
+    private void refreshServerButton() {
+        if (serverBtn == null) return;
+        String n = chosenServerName();
+        serverBtn.setText(n.isEmpty() ? "Choose server  \u25BE" : "Server: " + n + "  \u25BE");
+    }
+
+    /** Keeps the chosen server consistent with the selected protocol and the latest list. */
+    private void reconcileServer(boolean announce) {
+        String name = chosenServerName();
+        if (name.isEmpty() || servers == null) return;
+        ServerList.Server s = findServer(name);
+        if (s == null) {
+            clearServerSelection();
+            if (announce) toast("\"" + name + "\" is no longer in the list - no server chosen");
+            return;
+        }
+        if (!s.supports(protocol)) {
+            clearServerSelection();
+            if (announce) toast(s.name + " does not support " + ServerList.label(protocol) + " - no server chosen");
+            return;
+        }
+        applyServer(s, protocol);
+    }
+
+    /** Writes the server's settings for this protocol over the current configuration (also a locked / premade one). */
+    private void applyServer(ServerList.Server s, String proto) {
+        SharedPreferences.Editor e = prefs.edit();
+        for (java.util.Map.Entry<String, String> en : s.config(proto).entrySet()) {
+            String key = proto + "_" + en.getKey();
+            if (en.getKey().equals("insecure")) e.putBoolean(key, "true".equals(en.getValue()));
+            else e.putString(key, en.getValue());
+        }
+        e.apply();
+        if ("home".equals(page)) renderNotice();
+    }
+
+    private void chooseServer(ServerList.Server s) {
+        if (!s.supports(protocol)) {
+            clearServerSelection();
+            toast(s.name + " does not support " + ServerList.label(protocol) + " - no server chosen");
+            return;
+        }
+        prefs.edit().putString("server_selected", s.name).apply();
+        applyServer(s, protocol);
+        refreshServerButton();
+        toast(busy() ? s.name + " chosen - reconnect to use it" : "Server: " + s.name);
+    }
+
+    private LinearLayout serverRow(String name, String sub, boolean selected, boolean dim, View.OnClickListener click) {
+        LinearLayout r = row();
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(dp(14), dp(8), dp(14), dp(8));
+        r.setMinimumHeight(dp(60));
+        r.setBackground(rippled(selected ? shape(SOFT, 0, 0, 10) : null, 10));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(text(name, 15, selected ? ORANGE : TEXT, true));
+        col.addView(text(sub, 11, MUTED, false));
+        r.addView(col, new LinearLayout.LayoutParams(0, -2, 1));
+        if (selected) r.addView(icon(R.drawable.ic_check, 20, ORANGE));
+        if (dim) r.setAlpha(0.5f);
+        r.setOnClickListener(click);
+        return r;
+    }
+
+    private void showServerPicker() {
+        if (servers == null) {
+            toast("Connect to the internet to get the server list");
+            fetchServers(false);
+            return;
+        }
+        if (servers.isEmpty()) {
+            toast("No servers are available right now");
+            fetchServers(false);
+            return;
+        }
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(shape(CARD, BORDER, 1, 14));
+        box.setPadding(dp(8), dp(16), dp(8), dp(10));
+        TextView t = text("Choose server", 16, TEXT, true);
+        t.setPadding(dp(14), 0, dp(14), dp(2));
+        box.addView(t);
+        TextView sub = text("Protocol: " + ServerList.label(protocol), 12, MUTED, false);
+        sub.setPadding(dp(14), 0, dp(14), dp(8));
+        box.addView(sub);
+
+        final String cur = chosenServerName();
+        box.addView(serverRow("No server", "Use my own configuration", cur.isEmpty(), false, v -> {
+            d.dismiss();
+            clearServerSelection();
+            toast("No server chosen");
+        }));
+
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        for (final ServerList.Server s : servers) {
+            boolean ok = s.supports(protocol);
+            list.addView(serverRow(s.name, s.protocolSummary() + (ok ? "" : "  -  not on " + ServerList.label(protocol)),
+                    s.name.equals(cur), !ok, v -> {
+                        d.dismiss();
+                        chooseServer(s);
+                    }));
+        }
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(true);
+        sv.addView(list);
+        // more than four servers: the list shows four and a bit and scrolls
+        box.addView(sv, servers.size() > 4 ? new LinearLayout.LayoutParams(-1, dp(4 * 60 + 28))
+                : new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout foot = row();
+        foot.setGravity(Gravity.END);
+        TextView refresh = text("REFRESH", 12, ORANGE, true);
+        refresh.setPadding(dp(14), dp(12), dp(14), dp(4));
+        refresh.setOnClickListener(v -> {
+            toast("Refreshing the server list...");
+            fetchServers(true);
+        });
+        TextView cancel = text("CANCEL", 12, ORANGE, true);
+        cancel.setPadding(dp(14), dp(12), dp(14), dp(4));
+        cancel.setOnClickListener(v -> d.dismiss());
+        foot.addView(refresh);
+        foot.addView(cancel);
+        box.addView(foot);
+
+        d.setContentView(box);
+        if (d.getWindow() != null) {
+            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            d.getWindow().setLayout((int) (getResources().getDisplayMetrics().widthPixels * 0.88f),
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        d.show();
+    }
 
     // ================================================================== Sharenet
 
@@ -1868,6 +2143,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         SharedPreferences.Editor e = prefs.edit();
         for (String k : ConfigIO.keys(P)) e.remove(P + "_" + k);
         e.apply();
+        clearServerSelection();
         toast(P + " configuration reset");
         if (page.equals(P.toLowerCase(Locale.US))) show(P.toLowerCase(Locale.US));
     }
@@ -1970,7 +2246,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             return;
         }
         toast(proto + " configuration imported");
-        show(proto.toLowerCase(Locale.US));
+        afterImport(proto, false);
     }
 
     private void exportLink(String proto) {
@@ -2408,13 +2684,21 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 if (bo.size() > 1024 * 1024) throw new java.io.IOException("the file is too large");
             }
             JSONObject root = ConfigIO.parseFile(bo.toByteArray());
+            boolean auto = "AUTO".equals(proto);
+            if (auto) {
+                proto = detectProto(root);
+                if (proto == null) {
+                    toast("Import failed: this is not a Nanika configuration");
+                    return;
+                }
+            }
             String err = ConfigIO.fromJson(prefs, proto, root, HwId.get(this));
             if (err != null) {
                 toast("Import failed: " + err);
                 return;
             }
             toast(proto + " configuration imported");
-            show(proto.toLowerCase(Locale.US));
+            afterImport(proto, auto);
         } catch (Exception e) {
             toast("Import failed: " + e.getMessage());
         }
