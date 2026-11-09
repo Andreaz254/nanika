@@ -154,3 +154,19 @@ kept reporting the same old version to the server no matter how many times you u
   * Only TCP is shared (no UDP, no IPv6), like the tunnel itself.
 * Manifest: `ACCESS_WIFI_STATE`, `CHANGE_WIFI_STATE`, `ACCESS_FINE_LOCATION` (Android 12 and older),
   `NEARBY_WIFI_DEVICES` (Android 13+), used only for the hotspot.
+
+## Server picker + Import button
+
+* **Servers:** `servers/ServerList` does an HTTPS GET of `https://servers.freessh.indevs.in/` at launch (silent on any
+  failure) and caches the last good answer. Format: see `server/servers.example.json`. A protocol is supported when it
+  appears under `"protocols"` (`ssh`, `vless`, `vmess`; also accepted: a plain list of names with sibling settings).
+  Only host-type settings are applied (SSH: sshHost, proxyHost, proxyPort, sni, transport, payload, user, pass,
+  expiry, message; VLESS/VMess: server, connectIp, port, transport, sni, path, uuid, insecure, expiry, message);
+  anything a server leaves out keeps the user's own value. Applying works on imported / locked configs too.
+* **Choose server** button under the three protocol cards on Home, and "Choose server" in the side panel. The list has
+  a pinned "No server" row and scrolls when there are more than 4 servers. Changing protocol keeps the choice only if
+  the server supports it, otherwise it resets to "no server chosen". Never fetched + no internet: the button says to
+  connect to the internet. Importing a config or resetting one also clears the choice (the config brings its own server).
+* **Home top bar:** the LOGS button is now **IMPORT** (clipboard: vless:// / vmess:// link or Nanika JSON; file:
+  .anika / .json; the protocol is detected from the content). **LOGS** is a small chip at about 4 o'clock on the
+  connect circle (inside a fixed-height frame, so the circle and the cards did not move).
