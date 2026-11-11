@@ -14,6 +14,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
@@ -45,6 +46,7 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewOutlineProvider;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.animation.Animation;
@@ -133,6 +135,10 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     // server list (servers.freessh.indevs.in)
     private List<ServerList.Server> servers;       // null = never fetched on this install
     private Button serverBtn;
+
+    // Community links shown at the bottom of Home. An empty address hides that icon.
+    private static final String TELEGRAM_URL = "https://t.me/+fn-DT14YZe5kZTg0";
+    private static final String WHATSAPP_URL = "";      // paste your WhatsApp group link here (https://chat.whatsapp.com/...)
 
     // Sharenet page state
     private static final int PURPLE = Color.rgb(138, 77, 224);
@@ -366,7 +372,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         root.addView(drawer, new FrameLayout.LayoutParams(dp(290), -1));
         setContentView(root);
         checkForUpdate();
-        fetchServers(false);
+        fetchServers();
     }
 
     private void openDrawer() {
@@ -635,9 +641,9 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         logsChip.setElevation(dp(3));
         logsChip.setOnClickListener(v -> show("logs"));
         pressable(logsChip, 0.92f);
-        FrameLayout.LayoutParams lcp = new FrameLayout.LayoutParams(-2, dp(28), Gravity.BOTTOM | Gravity.END);
-        lcp.rightMargin = (dp(23));          // about 4 o'clock on the circle; the circle itself does not move
-        lcp.bottomMargin = (dp(0));
+        FrameLayout.LayoutParams lcp = new FrameLayout.LayoutParams(-2, dp(28), Gravity.CENTER);
+        logsChip.setTranslationX(dp(96));          // about 4 o'clock on the circle; the circle itself does not move
+        logsChip.setTranslationY(dp(60));
         hero.addView(logsChip, lcp);
         LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, dp(200));
         hp.topMargin = dp(8);
@@ -697,6 +703,18 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         noticeBox = new LinearLayout(this);
         noticeBox.setOrientation(LinearLayout.VERTICAL);
         body.addView(noticeBox, mp(-1, -2, 0, 20, 0, 0));
+
+        if (!TELEGRAM_URL.isEmpty() || !WHATSAPP_URL.isEmpty()) {
+            TextView cap = text("JOIN OUR COMMUNITY", 11, MUTED, true);
+            cap.setLetterSpacing(0.1f);
+            cap.setGravity(Gravity.CENTER);
+            body.addView(cap, mp(-1, -2, 0, 22, 0, 8));
+            LinearLayout social = row();
+            social.setGravity(Gravity.CENTER);
+            if (!TELEGRAM_URL.isEmpty()) social.addView(socialButton(R.drawable.ic_telegram, "Telegram group", TELEGRAM_URL), mp(46, 46, 10, 0, 10, 0));
+            if (!WHATSAPP_URL.isEmpty()) social.addView(socialButton(R.drawable.ic_whatsapp, "WhatsApp group", WHATSAPP_URL), mp(46, 46, 10, 0, 10, 0));
+            body.addView(social, mp(-1, -2, 0, 0, 0, 18));
+        }
 
         shownProtocol = null;
         updateCards(false);
@@ -1181,13 +1199,67 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     // ------------------------------------------------------------------ servers
 
-    private void fetchServers(final boolean verbose) {
+    private Dialog serverDialog;
+    private LinearLayout serverPinned, serverRows;
+    private ScrollView serverScroll;
+    private TextView serverNote, serverRefreshBtn;
+    private boolean serverFetching;
+    private long serverUpdatedAt;
+    private String serverFailNote = "";
+    private final Runnable serverAutoRefresh = new Runnable() {
+        @Override public void run() {
+            if (serverDialog != null && serverDialog.isShowing()) {
+                fetchServers();
+                ui.postDelayed(this, 30000);
+            }
+        }
+    };
+
+    /** Opens one of our own community links directly (no "are you sure" prompt, unlike links from a server message). */
+    private void openCommunityLink(String url) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addCategory(Intent.CATEGORY_BROWSABLE);
+            startActivity(i);
+        } catch (RuntimeException e) {
+            toast("No app can open this link");
+        }
+    }
+
+    private View socialButton(int res, String description, final String url) {
+        ImageView v = new ImageView(this);
+        v.setImageResource(res);
+        v.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        v.setContentDescription(description);
+        v.setOutlineProvider(new ViewOutlineProvider() {
+            @Override public void getOutline(View view, Outline o) { o.setOval(0, 0, view.getWidth(), view.getHeight()); }
+        });
+        v.setClipToOutline(true);
+        v.setElevation(dp(3));
+        v.setOnClickListener(x -> openCommunityLink(url));
+        pressable(v, 0.9f);
+        return v;
+    }
+
+    /** Downloads the list; the open picker (if any) updates in place, no need to close and reopen it. */
+    private void fetchServers() {
+        if (serverFetching) return;
+        serverFetching = true;
+        serverFailNote = "";
+        updateServerDialog();
         ServerList.fetch(this, prefs, list -> {
+            serverFetching = false;
             if (isFinishing()) return;
             servers = list;
+            serverUpdatedAt = System.currentTimeMillis();
             reconcileServer(false);
             refreshServerButton();
-            if (verbose) toast("Server list updated (" + list.size() + ")");
+            updateServerDialog();
+        }, () -> {
+            serverFetching = false;
+            serverFailNote = servers == null ? "Could not reach the server list. Connect to the internet."
+                    : "Could not refresh - showing the saved list.";
+            updateServerDialog();
         });
     }
 
@@ -1199,6 +1271,19 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     private String chosenServerName() {
         return prefs.getString("server_selected", "");
+    }
+
+    /** The chosen server's value for a setting (server address, SSH user / password, UUID), else the user's own. */
+    private String eff(String proto, String key, String def) {
+        String name = chosenServerName();
+        if (!name.isEmpty()) {
+            ServerList.Server s = findServer(name);
+            if (s != null) {
+                String v = s.config(proto).get(key);
+                if (v != null && !v.isEmpty()) return v;
+            }
+        }
+        return p(proto, key, def);
     }
 
     private void clearServerSelection() {
@@ -1220,26 +1305,10 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         if (s == null) {
             clearServerSelection();
             if (announce) toast("\"" + name + "\" is no longer in the list - no server chosen");
-            return;
-        }
-        if (!s.supports(protocol)) {
+        } else if (!s.supports(protocol)) {
             clearServerSelection();
             if (announce) toast(s.name + " does not support " + ServerList.label(protocol) + " - no server chosen");
-            return;
         }
-        applyServer(s, protocol);
-    }
-
-    /** Writes the server's settings for this protocol over the current configuration (also a locked / premade one). */
-    private void applyServer(ServerList.Server s, String proto) {
-        SharedPreferences.Editor e = prefs.edit();
-        for (java.util.Map.Entry<String, String> en : s.config(proto).entrySet()) {
-            String key = proto + "_" + en.getKey();
-            if (en.getKey().equals("insecure")) e.putBoolean(key, "true".equals(en.getValue()));
-            else e.putString(key, en.getValue());
-        }
-        e.apply();
-        if ("home".equals(page)) renderNotice();
     }
 
     private void chooseServer(ServerList.Server s) {
@@ -1249,7 +1318,6 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             return;
         }
         prefs.edit().putString("server_selected", s.name).apply();
-        applyServer(s, protocol);
         refreshServerButton();
         toast(busy() ? s.name + " chosen - reconnect to use it" : "Server: " + s.name);
     }
@@ -1271,17 +1339,57 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         return r;
     }
 
-    private void showServerPicker() {
+    /** Redraws the open picker from the current state (list, saved/failed/refreshing notes). */
+    private void updateServerDialog() {
+        if (serverDialog == null || !serverDialog.isShowing() || serverRows == null) return;
+        serverRefreshBtn.setText(serverFetching ? "REFRESHING..." : "REFRESH");
+        serverRefreshBtn.setAlpha(serverFetching ? 0.5f : 1f);
+
+        String note;
+        int color = MUTED;
         if (servers == null) {
-            toast("Connect to the internet to get the server list");
-            fetchServers(false);
-            return;
+            note = !serverFailNote.isEmpty() ? serverFailNote
+                    : serverFetching ? "Getting the server list..." : "No server list yet. Connect to the internet to get the servers.";
+            color = ORANGE;
+        } else if (servers.isEmpty()) {
+            note = "No servers are available right now.";
+        } else if (!serverFailNote.isEmpty()) {
+            note = serverFailNote;
+            color = ORANGE;
+        } else if (serverUpdatedAt > 0) {
+            note = "Updated " + new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date(serverUpdatedAt));
+        } else {
+            note = "Saved list - refreshing...";
         }
-        if (servers.isEmpty()) {
-            toast("No servers are available right now");
-            fetchServers(false);
-            return;
+        serverNote.setText(note);
+        serverNote.setTextColor(color);
+
+        final String cur = chosenServerName();
+        serverPinned.removeAllViews();
+        serverPinned.addView(serverRow("No server", "Use my own configuration", cur.isEmpty(), false, v -> {
+            serverDialog.dismiss();
+            clearServerSelection();
+            toast("No server chosen");
+        }));
+        serverRows.removeAllViews();
+        if (servers != null) {
+            for (final ServerList.Server s : servers) {
+                boolean ok = s.supports(protocol);
+                serverRows.addView(serverRow(s.name, s.protocolSummary() + (ok ? "" : "  -  not on " + ServerList.label(protocol)),
+                        s.name.equals(cur), !ok, v -> {
+                            serverDialog.dismiss();
+                            chooseServer(s);
+                        }));
+            }
         }
+        // more than four servers: the list shows four and a bit and scrolls
+        ViewGroup.LayoutParams lp = serverScroll.getLayoutParams();
+        lp.height = servers != null && servers.size() > 4 ? dp(4 * 60 + 28) : ViewGroup.LayoutParams.WRAP_CONTENT;
+        serverScroll.setLayoutParams(lp);
+    }
+
+    private void showServerPicker() {
+        if (serverDialog != null && serverDialog.isShowing()) return;
         final Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout box = new LinearLayout(this);
@@ -1292,45 +1400,32 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         t.setPadding(dp(14), 0, dp(14), dp(2));
         box.addView(t);
         TextView sub = text("Protocol: " + ServerList.label(protocol), 12, MUTED, false);
-        sub.setPadding(dp(14), 0, dp(14), dp(8));
+        sub.setPadding(dp(14), 0, dp(14), dp(2));
         box.addView(sub);
+        serverNote = text("", 11, MUTED, false);
+        serverNote.setPadding(dp(14), 0, dp(14), dp(8));
+        box.addView(serverNote);
 
-        final String cur = chosenServerName();
-        box.addView(serverRow("No server", "Use my own configuration", cur.isEmpty(), false, v -> {
-            d.dismiss();
-            clearServerSelection();
-            toast("No server chosen");
-        }));
+        serverPinned = new LinearLayout(this);
+        serverPinned.setOrientation(LinearLayout.VERTICAL);
+        box.addView(serverPinned);
 
-        LinearLayout list = new LinearLayout(this);
-        list.setOrientation(LinearLayout.VERTICAL);
-        for (final ServerList.Server s : servers) {
-            boolean ok = s.supports(protocol);
-            list.addView(serverRow(s.name, s.protocolSummary() + (ok ? "" : "  -  not on " + ServerList.label(protocol)),
-                    s.name.equals(cur), !ok, v -> {
-                        d.dismiss();
-                        chooseServer(s);
-                    }));
-        }
-        ScrollView sv = new ScrollView(this);
-        sv.setVerticalScrollBarEnabled(true);
-        sv.addView(list);
-        // more than four servers: the list shows four and a bit and scrolls
-        box.addView(sv, servers.size() > 4 ? new LinearLayout.LayoutParams(-1, dp(4 * 60 + 28))
-                : new LinearLayout.LayoutParams(-1, -2));
+        serverRows = new LinearLayout(this);
+        serverRows.setOrientation(LinearLayout.VERTICAL);
+        serverScroll = new ScrollView(this);
+        serverScroll.setVerticalScrollBarEnabled(true);
+        serverScroll.addView(serverRows);
+        box.addView(serverScroll, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout foot = row();
         foot.setGravity(Gravity.END);
-        TextView refresh = text("REFRESH", 12, ORANGE, true);
-        refresh.setPadding(dp(14), dp(12), dp(14), dp(4));
-        refresh.setOnClickListener(v -> {
-            toast("Refreshing the server list...");
-            fetchServers(true);
-        });
+        serverRefreshBtn = text("REFRESH", 12, ORANGE, true);
+        serverRefreshBtn.setPadding(dp(14), dp(12), dp(14), dp(4));
+        serverRefreshBtn.setOnClickListener(v -> fetchServers());
         TextView cancel = text("CANCEL", 12, ORANGE, true);
         cancel.setPadding(dp(14), dp(12), dp(14), dp(4));
         cancel.setOnClickListener(v -> d.dismiss());
-        foot.addView(refresh);
+        foot.addView(serverRefreshBtn);
         foot.addView(cancel);
         box.addView(foot);
 
@@ -1340,7 +1435,20 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             d.getWindow().setLayout((int) (getResources().getDisplayMetrics().widthPixels * 0.88f),
                     ViewGroup.LayoutParams.WRAP_CONTENT);
         }
+        d.setOnDismissListener(x -> {
+            ui.removeCallbacks(serverAutoRefresh);
+            serverDialog = null;
+            serverPinned = null;
+            serverRows = null;
+            serverScroll = null;
+            serverNote = null;
+            serverRefreshBtn = null;
+        });
+        serverDialog = d;
         d.show();
+        updateServerDialog();
+        fetchServers();                                   // fresh list every time the picker opens ...
+        ui.postDelayed(serverAutoRefresh, 30000);          // ... and again every 30 s while it stays open
     }
 
     // ================================================================== Sharenet
@@ -1822,9 +1930,9 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     private ProtocolConfig sshConfig() {
         final String P = "SSH";
         ProtocolConfig pc = new ProtocolConfig();
-        pc.sshUser = p(P, "user", "").trim();
-        pc.sshPassword = p(P, "pass", "");
-        pc.sshHost = p(P, "sshHost", ConfigIO.DEFAULT_SSH_HOST).trim();   // "Server Address": [host] in the payload
+        pc.sshUser = eff(P, "user", "").trim();
+        pc.sshPassword = eff(P, "pass", "");
+        pc.sshHost = eff(P, "sshHost", ConfigIO.DEFAULT_SSH_HOST).trim();   // "Server Address": [host] in the payload
         pc.sshPort = 22;
         pc.proxyHost = p(P, "proxyHost", "").trim();
         pc.tls = tlsOn(P);
@@ -1841,13 +1949,13 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 return ProtocolRegistry.require("SSH").validate(sshConfig());
             }
             ProtocolConfig pc = new ProtocolConfig();
-            pc.uuid = p(protocol, "uuid", "");
+            pc.uuid = eff(protocol, "uuid", "");
             String err = ProtocolRegistry.require(protocol).validate(pc);
             if (err != null) return err;
             int port = intOr(p(protocol, "port", "443"), -1);
             if (port < 1 || port > 65535) return "Port must be 1-65535";
             if (tlsOn(protocol) && p(protocol, "sni", "").trim().isEmpty()) return "SNI host is empty";
-            if (p(protocol, "server", "").trim().isEmpty()) return "Host header is empty";
+            if (eff(protocol, "server", "").trim().isEmpty()) return "Host header is empty";
             if (p(protocol, "connectIp", "").trim().isEmpty()) return "Connect IP is empty";
             return null;
         } catch (java.io.IOException e) {
@@ -1875,8 +1983,8 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             intent.putExtra("proxyPort", s.proxyPort);
             intent.putExtra("wsFrames", prefs.getBoolean("SSH_wsFrames", false));
         } else {
-            intent.putExtra("uuid", p(protocol, "uuid", "").trim());
-            intent.putExtra("server", p(protocol, "server", "").trim());
+            intent.putExtra("uuid", eff(protocol, "uuid", "").trim());
+            intent.putExtra("server", eff(protocol, "server", "").trim());
             intent.putExtra("connectIp", p(protocol, "connectIp", "").trim());
             intent.putExtra("port", intOr(p(protocol, "port", "443"), 443));
             intent.putExtra("bug", p(protocol, "sni", "").trim());
