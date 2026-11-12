@@ -36,7 +36,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
-PORT = 8788
+PORT = 8787
 RELEASES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "releases")
 NAME_RE = re.compile(r"^nanika-v([0-9]+(?:\.[0-9]+)*)\.apk$", re.IGNORECASE)
 

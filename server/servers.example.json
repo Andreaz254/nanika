@@ -3,35 +3,15 @@
     {
       "name": "Kenya 1",
       "protocols": {
-        "ssh": {
-          "sshHost": "naruto.freessh.indevs.in",
-          "proxyHost": "naruto.freessh.indevs.in",
-          "proxyPort": 443,
-          "sni": "naruto.freessh.indevs.in",
-          "transport": "TLS"
-        },
-        "vless": {
-          "connectIp": "cdn.tailwindcss.com",
-          "server": "one.freessh.indevs.in",
-          "port": 443,
-          "transport": "TLS",
-          "sni": "one.freessh.indevs.in",
-          "path": "/vless"
-        },
-        "vmess": {
-          "connectIp": "cdn.tailwindcss.com",
-          "server": "two.freessh.indevs.in",
-          "port": 443,
-          "transport": "TLS",
-          "sni": "two.freessh.indevs.in",
-          "path": "/vmess"
-        }
+        "ssh": { "sshHost": "ws-server1.freessh.indevs.in", "user": "makeli", "pass": "makeli" },
+        "vless": { "server": "ws-server1.freessh.indevs.in", "uuid": "00000000-0000-0000-0000-000000000000" },
+        "vmess": { "server": "ws-server1.freessh.indevs.in", "uuid": "00000000-0000-0000-0000-000000000000" }
       }
     },
     {
       "name": "Kenya 2 (SSH only)",
       "protocols": {
-        "ssh": { "sshHost": "ssh2.freessh.indevs.in", "proxyHost": "ssh2.freessh.indevs.in", "proxyPort": 80, "transport": "Non-TLS" }
+        "ssh": { "sshHost": "ws-server2.freessh.indevs.in", "user": "makeli", "pass": "makeli" }
       }
     }
   ]
