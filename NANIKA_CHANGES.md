@@ -170,3 +170,16 @@ kept reporting the same old version to the server no matter how many times you u
 * **Home top bar:** the LOGS button is now **IMPORT** (clipboard: vless:// / vmess:// link or Nanika JSON; file:
   .anika / .json; the protocol is detected from the content). **LOGS** is a small chip at about 4 o'clock on the
   connect circle (inside a fixed-height frame, so the circle and the cards did not move).
+
+## Server list: server only, applied at connect time + live picker + community links
+
+* **Only the server is taken from the list.** SSH: `sshHost`, `user`, `pass`. VLESS / VMess: `server` (host header), `uuid`.
+  Proxy host, port, SNI, transport, path, payload (and `connectIp`, `expiry`, `message` ...) are ignored even when the
+  JSON contains them: they always come from the user's own configuration (e.g. proxy, port 80, no SNI, own payload).
+* **Nothing is written into the settings pages.** The chosen server is applied by `eff(...)` in MainActivity when the
+  connection settings are built (`sshConfig`, `validateStored`, `buildIntent`). Works with imported / locked configs too.
+* **Picker refreshes itself.** It fetches when it opens, again every 30 s while open, and REFRESH updates the open list in
+  place (with "Refreshing...", "Updated hh:mm:ss" or "Could not refresh - showing the saved list"). First install without
+  internet: the picker explains that the server list needs internet and fills in as soon as it arrives.
+* **Home:** Telegram (https://t.me/+fn-DT14YZe5kZTg0) and WhatsApp icons under the cards. `WHATSAPP_URL` in MainActivity is
+  empty: paste your WhatsApp group link there; while it is empty the WhatsApp icon is not shown.
