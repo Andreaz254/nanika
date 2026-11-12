@@ -20,22 +20,25 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
- * The server list, fetched with an HTTPS GET from servers.freessh.indevs.in when the app starts.
+ * The server list, fetched with an HTTPS GET from servers.freessh.indevs.in when the app starts and refreshed
+ * while the picker is open.
  *
  * Accepted JSON (either a top-level array or {"servers":[...]}):
  *   {"servers":[
  *     {"name":"Kenya 1",
  *      "protocols":{
- *        "ssh":  {"sshHost":"...","proxyHost":"...","proxyPort":443,"sni":"...","transport":"TLS"},
- *        "vless":{"server":"...","connectIp":"...","port":443,"transport":"TLS","sni":"...","path":"/vless"},
- *        "vmess":{...}}}]}
+ *        "ssh":  {"sshHost":"ws-server1.example.com","user":"u1","pass":"p1"},
+ *        "vless":{"server":"ws-server1.example.com","uuid":"..."},
+ *        "vmess":{"server":"ws-server1.example.com","uuid":"..."}}}]}
  * A protocol is supported when it appears under "protocols". "protocols" may also be a plain list of names
- * ("protocols":["ssh","vless"]) with the settings in sibling keys ("ssh":{...}). Only the keys listed in
- * {@link #ALLOWED} are ever applied (a server can move you to another host, it cannot change anything else).
- * If the server entry leaves out uuid / user / pass / path / payload, the values you already have stay.
+ * ("protocols":["ssh","vless"]) with the values in sibling keys ("ssh":{...}).
+ *
+ * ONLY the server itself is taken from the list: SSH sshHost / user / pass and VLESS / VMess server (host header) /
+ * uuid. Every other key (proxy host, ports, SNI, transport, path, payload, connectIp ...) is ignored even when the
+ * server sends it: the proxy, payload, port and SNI always come from the user's own configuration. The values are
+ * used when connecting; they are never written into the settings pages.
  */
 public final class ServerList {
     public static final String HOST = "servers.freessh.indevs.in";
@@ -43,13 +46,10 @@ public final class ServerList {
     private static final String CACHE_KEY = "servers_json";
     private static final String API_TOKEN = "PASTE_YOUR_TOKEN";
 
-    private static final Pattern DATE = Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
-    private static final List<String> SSH_KEYS = java.util.Arrays.asList(
-            "sshHost", "user", "pass", "proxyHost", "proxyPort", "sni", "transport", "payload", "expiry", "message");
-    private static final List<String> WS_KEYS = java.util.Arrays.asList(
-            "uuid", "server", "connectIp", "port", "transport", "sni", "path", "insecure", "expiry", "message");
+    private static final List<String> SSH_KEYS = java.util.Arrays.asList("sshHost", "user", "pass");
+    private static final List<String> WS_KEYS = java.util.Arrays.asList("server", "uuid");
 
     private ServerList() {}
 
@@ -152,7 +152,7 @@ public final class ServerList {
         }
     }
 
-    /** Keeps only allowed keys and sane values. */
+    /** Keeps only the allowed keys (server address, credentials, uuid). */
     private static Map<String, String> clean(String proto, JSONObject cfg) {
         Map<String, String> m = new LinkedHashMap<String, String>();
         if (cfg == null) return m;
@@ -161,29 +161,7 @@ public final class ServerList {
             Object raw = cfg.opt(k);
             if (raw == null || raw == JSONObject.NULL) continue;
             String v = String.valueOf(raw).trim();
-            if (k.equals("message")) {
-                if (v.length() > 4000) v = v.substring(0, 4000);
-            } else if (v.length() > 500) {
-                continue;
-            }
-            if (k.equals("transport")) {
-                String l = v.toLowerCase(Locale.US).replace("-", "").replace("_", "").replace(" ", "");
-                if (l.equals("tls") || l.equals("ssl") || l.equals("sni")) v = "TLS";
-                else if (l.equals("nontls") || l.equals("notls") || l.equals("none") || l.equals("plain") || l.equals("ws")) v = "Non-TLS";
-                else continue;
-            } else if (k.equals("port") || k.equals("proxyPort")) {
-                try {
-                    int n = Integer.parseInt(v);
-                    if (n < 1 || n > 65535) continue;
-                    v = String.valueOf(n);
-                } catch (NumberFormatException e) {
-                    continue;
-                }
-            } else if (k.equals("insecure")) {
-                v = (v.equalsIgnoreCase("true") || v.equals("1")) ? "true" : "false";
-            } else if (k.equals("expiry")) {
-                if (!DATE.matcher(v).matches()) continue;
-            }
+            if (v.isEmpty() || v.length() > 300) continue;
             m.put(k, v);
         }
         return m;
@@ -204,8 +182,15 @@ public final class ServerList {
 
     public interface Listener { void onList(List<Server> servers); }
 
-    /** HTTPS GET in the background; any failure is ignored silently (the cached list, if any, stays in use). */
-    public static void fetch(final Context ctx, final SharedPreferences prefs, final Listener l) {
+    public static void fetch(Context ctx, SharedPreferences prefs, Listener ok) {
+        fetch(ctx, prefs, ok, null);
+    }
+
+    /**
+     * HTTPS GET in the background. {@code ok} runs on the main thread with the new list; {@code fail} (may be null)
+     * runs there when nothing usable came back (no internet, bad answer). The saved list stays in use then.
+     */
+    public static void fetch(final Context ctx, final SharedPreferences prefs, final Listener ok, final Runnable fail) {
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
@@ -216,25 +201,28 @@ public final class ServerList {
                     c.setRequestProperty("Accept", "application/json");
                     c.setRequestProperty("Authorization", "Bearer " + API_TOKEN);
                     c.setRequestProperty("User-Agent", "Nanika");
-                    if (c.getResponseCode() != 200) return;
-                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
-                    try (InputStream in = c.getInputStream()) {
-                        byte[] buf = new byte[4096];
-                        int n;
-                        while ((n = in.read(buf)) > 0) {
-                            bo.write(buf, 0, n);
-                            if (bo.size() > 256 * 1024) throw new IOException("too large");
+                    if (c.getResponseCode() == 200) {
+                        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                        try (InputStream in = c.getInputStream()) {
+                            byte[] buf = new byte[4096];
+                            int n;
+                            while ((n = in.read(buf)) > 0) {
+                                bo.write(buf, 0, n);
+                                if (bo.size() > 256 * 1024) throw new IOException("too large");
+                            }
                         }
+                        final String text = bo.toString("UTF-8");
+                        final List<Server> list = parse(text);              // throws if unusable: then nothing is saved
+                        prefs.edit().putString(CACHE_KEY, text).apply();
+                        MAIN.post(new Runnable() {
+                            @Override public void run() { ok.onList(list); }
+                        });
+                        return;
                     }
-                    final String text = bo.toString("UTF-8");
-                    final List<Server> list = parse(text);                  // throws if unusable: then nothing is saved
-                    prefs.edit().putString(CACHE_KEY, text).apply();
-                    MAIN.post(new Runnable() {
-                        @Override public void run() { l.onList(list); }
-                    });
                 } catch (Exception ignored) {
-                    // no internet / bad answer: ignore silently
+                    // no internet / bad answer: fall through to the failure callback
                 }
+                if (fail != null) MAIN.post(fail);
             }
         }, "server-list").start();
     }
