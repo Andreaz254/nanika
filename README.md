@@ -17,3 +17,6 @@ Android tunnel client with three protocols: SSH over WebSocket, VLESS and VMess.
 ./gradlew assembleDebug
 ```
 Set `API_TOKEN` in `servers/ServerList.java` to the token your server-list host expects.
+
+ # Pictures
+ https://github.com/Andreaz254/nanika/blob/main/image.png
