@@ -18,5 +18,5 @@ Android tunnel client with three protocols: SSH over WebSocket, VLESS and VMess.
 ```
 Set `API_TOKEN` in `servers/ServerList.java` to the token your server-list host expects.
 
- # Pictures
- https://github.com/Andreaz254/nanika/blob/main/image.png
+## Pictures
+![Nanika screenshot](https://github.com/Andreaz254/nanika/blob/main/image.png?raw=true)
