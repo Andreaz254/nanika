@@ -1,5 +1,6 @@
 package com.example.tunnel.update;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -15,16 +16,21 @@ import java.security.MessageDigest;
 import java.util.Locale;
 
 /**
- * Checks updates.freessh.indevs.in for a newer release and downloads it. All methods are blocking (run them
- * off the UI thread); the caller marshals callbacks back to the UI thread itself.
+ * Checks the latest GitHub Release of a PUBLIC repository for a newer APK and downloads it. All methods are
+ * blocking (run them off the UI thread); the caller marshals callbacks back to the UI thread itself.
  *
- * Expected server reply (GET, JSON): {"version":"1.17","file":"nanika-v1.17.apk","sha256":"...","size":123}
- * "url" may be given explicitly instead of "file"; otherwise it is built as CHECK_URL + "downloads/" + file.
+ * Release rules: the tag is the version ("v1.7" or "1.7"), and the release has one asset whose name ends in
+ * ".apk". Drafts and pre-releases are ignored by GitHub's "latest" endpoint.
  */
 public final class UpdateManager {
     private UpdateManager() {}
 
-    public static final String CHECK_URL = "https://updates.freessh.indevs.in/";
+    /** EDIT THESE TWO: the GitHub account and the (public) repository that holds your releases. */
+    public static final String GITHUB_OWNER = "YOUR_GITHUB_USERNAME";
+    public static final String GITHUB_REPO = "nanika-releases";
+
+    public static final String CHECK_URL =
+            "https://api.github.com/repos/" + Andreaz254 + "/" + nanika + "/releases/latest";
     private static final int TIMEOUT_MS = 8000;
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
@@ -54,14 +60,14 @@ public final class UpdateManager {
 
     public static void check(String currentVersion, CheckListener l) {
         try {
-            String body = httpGet(CHECK_URL);
-            JSONObject j = new JSONObject(body);
-            String version = j.optString("version", "").trim();
-            String file = j.optString("file", "").trim();
-            String urlPath = j.optString("url", file.isEmpty() ? "" : "downloads/" + file).trim();
-            String sha256 = j.optString("sha256", "").trim();
-            long size = j.optLong("size", 0);
-            if (version.isEmpty() || (file.isEmpty() && urlPath.isEmpty())) {
+            JSONObject j = new JSONObject(httpGet(CHECK_URL));
+            if (j.optBoolean("draft", false) || j.optBoolean("prerelease", false)) {
+                l.onNoUpdate();
+                return;
+            }
+            String version = j.optString("tag_name", "").trim().replaceFirst("^[vV]", "");
+            JSONArray assets = j.optJSONArray("assets");
+            if (version.isEmpty() || assets == null) {
                 l.onNoUpdate();
                 return;
             }
@@ -69,15 +75,31 @@ public final class UpdateManager {
                 l.onNoUpdate();
                 return;
             }
-            String full = urlPath.toLowerCase(Locale.US).startsWith("http")
-                    ? urlPath : CHECK_URL.replaceAll("/+$", "") + "/" + urlPath.replaceAll("^/+", "");
-            if (!full.toLowerCase(Locale.US).startsWith("https://")) {
+            JSONObject apk = null;
+            for (int i = 0; i < assets.length(); i++) {
+                JSONObject a = assets.optJSONObject(i);
+                if (a != null && a.optString("name", "").toLowerCase(Locale.US).endsWith(".apk")) {
+                    apk = a;
+                    break;
+                }
+            }
+            if (apk == null) {
+                l.onNoUpdate();
+                return;
+            }
+            String file = new File(apk.optString("name", "nanika-v" + version + ".apk")).getName();
+            String url = apk.optString("browser_download_url", "").trim();
+            long size = apk.optLong("size", 0);
+            // GitHub reports "sha256:<hex>" for each asset; verified after the download when present.
+            String digest = apk.optString("digest", "").trim();
+            String sha256 = digest.toLowerCase(Locale.US).startsWith("sha256:") ? digest.substring(7) : "";
+            if (!url.toLowerCase(Locale.US).startsWith("https://")) {
                 l.onNoUpdate();                      // refuse a non-HTTPS download URL - treat like no update
                 return;
             }
-            l.onUpdateAvailable(new Info(version, file, full, sha256, size));
+            l.onUpdateAvailable(new Info(version, file, url, sha256, size));
         } catch (Exception e) {
-            l.onNoUpdate();                          // offline, timeout, bad JSON, ... -> ignore silently
+            l.onNoUpdate();                          // offline, rate-limited, bad JSON, ... -> ignore silently
         }
     }
 
@@ -106,7 +128,8 @@ public final class UpdateManager {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(TIMEOUT_MS);
         c.setReadTimeout(TIMEOUT_MS);
-        c.setRequestProperty("Accept", "application/json");
+        c.setRequestProperty("Accept", "application/vnd.github+json");
+        c.setRequestProperty("User-Agent", "Nanika-Updater");
         try {
             int code = c.getResponseCode();
             if (code != 200) throw new IOException("HTTP " + code);
@@ -128,6 +151,7 @@ public final class UpdateManager {
             c = (HttpURLConnection) new URL(info.url).openConnection();
             c.setConnectTimeout(TIMEOUT_MS);
             c.setReadTimeout(20000);
+            c.setRequestProperty("User-Agent", "Nanika-Updater");
             int code = c.getResponseCode();
             if (code != 200) throw new IOException("HTTP " + code);
             long total = c.getContentLengthLong();
