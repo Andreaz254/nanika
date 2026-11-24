@@ -1,5 +1,9 @@
 package com.example.tunnel;
 
+
+import android.graphics.Outline;
+import android.provider.Settings;
+import android.view.ViewOutlineProvider;
 import android.Manifest;
 import android.animation.LayoutTransition;
 import android.annotation.SuppressLint;
@@ -14,8 +18,6 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.database.Cursor;
-import android.provider.OpenableColumns;
-import android.util.Log;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
@@ -24,14 +26,14 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 import android.net.VpnService;
 import android.os.Build;
-import android.os.Build;
+import android.util.Log;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
-import android.provider.Settings;
 import android.text.InputType;
 import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
@@ -73,7 +75,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import android.provider.Settings;
+import com.example.tunnel.servers.ServerList;
 import com.example.tunnel.share.ShareHotspot;
 import com.example.tunnel.share.ShareManager;
 import com.example.tunnel.share.ShareProxy;
@@ -131,6 +133,14 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     private SharedPreferences prefs;
     private final Handler ui = new Handler(Looper.getMainLooper());
+
+    // server list (servers.freessh.indevs.in)
+    private List<ServerList.Server> servers;       // null = never fetched on this install
+    private Button serverBtn;
+
+    // Community links shown at the bottom of Home. An empty address hides that icon.
+    private static final String TELEGRAM_URL = "https://t.me/+fn-DT14YZe5kZTg0";
+    private static final String WHATSAPP_URL = "";      // paste your WhatsApp group link here (https://chat.whatsapp.com/...)
 
     // Sharenet page state
     private static final int PURPLE = Color.rgb(138, 77, 224);
@@ -235,76 +245,135 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     // ================================================================== lifecycle
 
+    /** Marks an incoming intent as already taken, so a recreated activity never imports it twice. */
+    private static final String EXTRA_CONSUMED = "nanika_incoming_consumed";
+
+    /** A file / text shared or opened from outside; imported in onResume once the UI is up. */
+    private Intent pendingIncoming;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("dark_custom_settings", MODE_PRIVATE);
         protocol = prefs.getString("protocol", "SSH");
+        servers = ServerList.load(prefs);
         applyTheme();
         buildShell();
         show("home");
-        handleIncomingFile(getIntent());
+        // A .anika file opened from WhatsApp / a file manager arrives with the launch intent.
+        // After a rotation or process restore Android hands us the same intent again, so it is
+        // only taken on a fresh start (savedInstanceState == null).
+        if (savedInstanceState == null) queueIncoming(getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        handleIncomingFile(intent);
+        queueIncoming(intent);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Import here, not in onCreate/onNewIntent: the window is visible, the toast is seen and the
+        // home page is certain to be built.
+        if (pendingIncoming != null) {
+            Intent in = pendingIncoming;
+            pendingIncoming = null;
+            handleIncomingFile(in);
+        }
+    }
+
+    private static boolean isIncomingAction(String a) {
+        return Intent.ACTION_VIEW.equals(a) || Intent.ACTION_SEND.equals(a)
+                || Intent.ACTION_SEND_MULTIPLE.equals(a);
+    }
+
+    private void queueIncoming(Intent intent) {
+        if (intent == null || !isIncomingAction(intent.getAction())) return;
+        if ((intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return;
+        if (intent.getBooleanExtra(EXTRA_CONSUMED, false)) return;
+        intent.putExtra(EXTRA_CONSUMED, true);
+        pendingIncoming = intent;
+    }
+
+    /** First file URI of a SEND / SEND_MULTIPLE / VIEW intent: EXTRA_STREAM first, then ClipData. */
+    private static Uri incomingUri(Intent intent) {
+        Uri uri = null;
+        final String action = intent.getAction();
+        if (Intent.ACTION_VIEW.equals(action)) {
+            uri = intent.getData();
+        } else if (Intent.ACTION_SEND.equals(action)) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                uri = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+            } else {
+                //noinspection deprecation
+                uri = (Uri) intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            }
+        } else if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+            ArrayList<Uri> streams;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                streams = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class);
+            } else {
+                //noinspection deprecation
+                streams = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            }
+            if (streams != null && !streams.isEmpty()) uri = streams.get(0);
+        }
+        if (uri == null && intent.getClipData() != null && intent.getClipData().getItemCount() > 0) {
+            uri = intent.getClipData().getItemAt(0).getUri();
+        }
+        return uri;
     }
 
     /**
-     * WhatsApp (and most chat apps) hand us an opaque content:// URI such as
-     * content://com.whatsapp.provider.media/item/<uuid> with type application/octet-stream -
-     * the real file name is NOT in the URI's path, so an intent-filter pathPattern can never
-     * match it. We resolve the display name via the ContentResolver instead and check the
-     * ".anika" extension here, in code, after Android has already routed the VIEW intent to us.
+     * Handles a file (content:// or file://) opened or shared from WhatsApp, a file manager, etc.
+     * Nothing is dropped silently any more: every failure shows a message. The file name is no longer
+     * used to reject a file (providers rename files or hide the name); ConfigIO validates the content,
+     * exactly as for the in-app IMPORT button.
      */
     private void handleIncomingFile(Intent intent) {
-        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
-        Uri uri = intent.getData();
-        if (uri == null) return;
+        if (intent == null) return;
+        final String action = intent.getAction();
+        if (!isIncomingAction(action)) return;
 
-        String name = null;
-        if ("content".equals(uri.getScheme())) {
-            try (Cursor c = getContentResolver().query(uri, null, null, null, null)) {
-                if (c != null && c.moveToFirst()) {
-                    int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                    if (idx >= 0) name = c.getString(idx);
+        Uri uri = incomingUri(intent);
+
+        if (uri == null) {
+            // Shared as plain text (a vless:// / vmess:// link or a JSON config pasted into a chat).
+            if (!Intent.ACTION_VIEW.equals(action)) {
+                CharSequence txt = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
+                if (txt != null && txt.toString().trim().length() > 0) {
+                    importAutoText(txt.toString());
+                    return;
                 }
-            } catch (Exception e) {
-                Log.w("Nanika", "Could not resolve display name for " + uri, e);
             }
-        } else if ("file".equals(uri.getScheme())) {
-            String path = uri.getPath();
-            if (path != null) name = new File(path).getName();
-        }
-
-        if (name == null || !name.toLowerCase(Locale.ROOT).endsWith(".anika")) {
-            Log.d("Nanika", "Ignoring non-.anika file: " + name + " (" + uri + ")");
+            Log.w("Nanika", "External import intent has no URI. action=" + action);
+            toast("Import failed: no file was received");
             return;
         }
 
-        try (InputStream in = getContentResolver().openInputStream(uri)) {
-            if (in == null) throw new java.io.IOException("cannot open " + uri);
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-            byte[] chunk = new byte[8192];
-            int read;
-            while ((read = in.read(chunk)) != -1) buffer.write(chunk, 0, read);
-            importAnikaFile(name, buffer.toByteArray());
+        String name = null;
+        try {
+            if ("content".equalsIgnoreCase(uri.getScheme())) {
+                try (Cursor c = getContentResolver().query(
+                        uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                    if (c != null && c.moveToFirst()) {
+                        int index = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                        if (index >= 0) name = c.getString(index);
+                    }
+                }
+            } else if ("file".equalsIgnoreCase(uri.getScheme())) {
+                String path = uri.getPath();
+                if (path != null) name = new File(path).getName();
+            }
         } catch (Exception e) {
-            toast("Failed to open " + name + ": " + e.getMessage());
+            Log.w("Nanika", "Could not resolve external filename: " + uri, e);
         }
-    }
+        Log.i("Nanika", "External import received. action=" + action + ", name=" + name + ", uri=" + uri);
 
-    /**
-     * Hook up your real .anika import logic here (e.g. route into ConfigIO / importFromUri-style
-     * handling). Left as a stub so it doesn't collide with whatever the existing import flow for
-     * SSH/VLESS/VMess configs expects.
-     */
-    private void importAnikaFile(String fileName, byte[] data) {
-        toast("Received " + fileName + " (" + data.length + " bytes)");
-        // TODO: parse/apply the .anika payload, e.g. ConfigIO.importAnika(this, data);
+        importFromUri("AUTO", uri);
     }
 
     @Override
@@ -425,6 +494,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         root.addView(drawer, new FrameLayout.LayoutParams(dp(290), -1));
         setContentView(root);
         checkForUpdate();
+        fetchServers();
     }
 
     private void openDrawer() {
@@ -471,6 +541,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         drawerItem(0, GlyphDrawable.VMESS, "VMess", "vmess");
         drawerItem(R.drawable.ic_terminal, -1, "Logs", "logs");
         drawerItem(R.drawable.ic_share, -1, "Sharenet", "share");
+        drawerItem(R.drawable.ic_server, -1, "Choose server", "servers");
         View line = new View(this);
         line.setBackgroundColor(BORDER);
         drawer.addView(line, mp(-1, 1, 6, 14, 6, 14));
@@ -489,6 +560,10 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         item.addView(t);
         item.setOnClickListener(v -> {
             closeDrawer();
+            if (target.equals("servers")) {
+                showServerPicker();
+                return;
+            }
             if (target.equals("ssh")) selectProtocol("SSH");
             else if (target.equals("vless")) selectProtocol("VLESS");
             else if (target.equals("vmess")) selectProtocol("VMess");
@@ -522,15 +597,15 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         dotSpinner = icon(R.drawable.ic_spinner, 20, ORANGE);
         dot.addView(dotSpinner, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
         bar.addView(dot, new LinearLayout.LayoutParams(dp(24), dp(24)));
-        TextView logsBtn = text("LOGS", 12, Color.WHITE, true);
-        logsBtn.setLetterSpacing(0.08f);
-        logsBtn.setGravity(Gravity.CENTER);
-        logsBtn.setPadding(dp(14), 0, dp(14), 0);
-        logsBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF),
+        TextView importBtn = text("IMPORT", 12, Color.WHITE, true);
+        importBtn.setLetterSpacing(0.08f);
+        importBtn.setGravity(Gravity.CENTER);
+        importBtn.setPadding(dp(14), 0, dp(14), 0);
+        importBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF),
                 shape(ORANGE, 0, 0, 4), shape(Color.WHITE, 0, 0, 4)));
-        logsBtn.setOnClickListener(v -> show("logs"));
-        pressable(logsBtn, 0.92f);
-        bar.addView(logsBtn, mp(-2, 32, 12, 0, 0, 0));
+        importBtn.setOnClickListener(v -> showImportMenu());
+        pressable(importBtn, 0.92f);
+        bar.addView(importBtn, mp(-2, 32, 12, 0, 0, 0));
         return bar;
     }
 
@@ -642,6 +717,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         if (shareTick != null) ui.removeCallbacks(shareTick);
         shareTick = null;
         graph = null; shareStatus = null; liveDown = null; liveUp = null; liveStats = null; hotspotInfo = null; hotspotBtn = null;
+        serverBtn = null;
         connectBtn = null; statusIcon = null;
         statusText = null; dotView = null; dotSpinner = null; logView = null;
         noticeBox = null; bannerCard = null; bannerText = null; shownBanner = null;
@@ -666,6 +742,8 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         }
         protocol = p;
         prefs.edit().putString("protocol", p).apply();
+        reconcileServer(true);
+        refreshServerButton();
     }
 
     // ================================================================== HOME
@@ -673,10 +751,25 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     private void buildHome() {
         connectBtn = new ConnectButton(this, CARD, SOFT);
         connectBtn.setOnClickListener(v -> onButton());
-        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(dp(200), dp(200));
-        hp.gravity = Gravity.CENTER_HORIZONTAL;
+        FrameLayout hero = new FrameLayout(this);
+        hero.setClipChildren(false);
+        hero.addView(connectBtn, new FrameLayout.LayoutParams(dp(200), dp(200), Gravity.CENTER));
+        TextView logsChip = text("LOGS", 11, Color.WHITE, true);
+        logsChip.setLetterSpacing(0.08f);
+        logsChip.setGravity(Gravity.CENTER);
+        logsChip.setPadding(dp(12), 0, dp(12), 0);
+        logsChip.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF),
+                shape(ORANGE, 0, 0, 4), shape(Color.WHITE, 0, 0, 4)));
+        logsChip.setElevation(dp(3));
+        logsChip.setOnClickListener(v -> show("logs"));
+        pressable(logsChip, 0.92f);
+        FrameLayout.LayoutParams lcp = new FrameLayout.LayoutParams(-2, dp(28), Gravity.CENTER);
+        logsChip.setTranslationX(dp(96));          // about 4 o'clock on the circle; the circle itself does not move
+        logsChip.setTranslationY(dp(60));
+        hero.addView(logsChip, lcp);
+        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, dp(200));
         hp.topMargin = dp(8);
-        body.addView(connectBtn, hp);
+        body.addView(hero, hp);
 
         LinearLayout status = row();
         status.setGravity(Gravity.CENTER);
@@ -724,9 +817,26 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         }
         body.addView(cards);
 
+        serverBtn = outlineButton("Choose server");
+        serverBtn.setOnClickListener(v -> showServerPicker());
+        body.addView(serverBtn, mp(-1, 46, 0, 14, 0, 0));
+        refreshServerButton();
+
         noticeBox = new LinearLayout(this);
         noticeBox.setOrientation(LinearLayout.VERTICAL);
         body.addView(noticeBox, mp(-1, -2, 0, 20, 0, 0));
+
+        if (!TELEGRAM_URL.isEmpty() || !WHATSAPP_URL.isEmpty()) {
+            TextView cap = text("JOIN OUR COMMUNITY", 11, MUTED, true);
+            cap.setLetterSpacing(0.1f);
+            cap.setGravity(Gravity.CENTER);
+            body.addView(cap, mp(-1, -2, 0, 22, 0, 8));
+            LinearLayout social = row();
+            social.setGravity(Gravity.CENTER);
+            if (!TELEGRAM_URL.isEmpty()) social.addView(socialButton(R.drawable.ic_telegram, "Telegram group", TELEGRAM_URL), mp(46, 46, 10, 0, 10, 0));
+            if (!WHATSAPP_URL.isEmpty()) social.addView(socialButton(R.drawable.ic_whatsapp, "WhatsApp group", WHATSAPP_URL), mp(46, 46, 10, 0, 10, 0));
+            body.addView(social, mp(-1, -2, 0, 0, 0, 18));
+        }
 
         shownProtocol = null;
         updateCards(false);
@@ -1132,6 +1242,349 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
 
     // ================================================================== Settings page
 
+
+
+    // ================================================================== Import button (home) + server picker
+
+    private static String detectProto(JSONObject root) {
+        String t = root.optString("type", "");
+        if (t.equalsIgnoreCase("ssh")) return "SSH";
+        if (t.equalsIgnoreCase("vless")) return "VLESS";
+        if (t.equalsIgnoreCase("vmess")) return "VMess";
+        return null;
+    }
+
+    /** After a config was imported: it brings its own server, so no listed server stays chosen. */
+    private void afterImport(String proto, boolean fromHome) {
+        clearServerSelection();
+        if (fromHome) {
+            if (!busy()) {
+                protocol = proto;
+                prefs.edit().putString("protocol", proto).apply();
+            } else {
+                toast("Stop the VPN to switch to the imported " + proto + " configuration");
+            }
+            show("home");
+        } else {
+            show(proto.toLowerCase(Locale.US));
+        }
+    }
+
+    private void showImportMenu() {
+        choose("Import configuration", new String[]{"From clipboard", "From file (.anika or .json)"}, new Runnable[]{
+                this::importAutoClipboard,
+                () -> pickImportFile("AUTO")});
+    }
+
+    /** A vless:// or vmess:// link, or a Nanika JSON, from the clipboard: the protocol is detected from the content. */
+    private void importAutoClipboard() {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        String text = "";
+        if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null && cm.getPrimaryClip().getItemCount() > 0) {
+            CharSequence cs = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
+            if (cs != null) text = cs.toString();
+        }
+        importAutoText(text);
+    }
+
+    /** Imports a vless:// / vmess:// link or a Nanika JSON from text (clipboard or a shared message). */
+    private void importAutoText(String text) {
+        String t = text == null ? "" : text.trim();
+        String low = t.toLowerCase(Locale.US);
+        if (!(low.startsWith("vless://") || low.startsWith("vmess://") || t.startsWith("{"))) {
+            // A link inside a longer chat message.
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)(vless|vmess)://\\S+").matcher(t);
+            if (m.find()) {
+                t = m.group().trim();
+                low = t.toLowerCase(Locale.US);
+            }
+        }
+        String proto;
+        String err;
+        if (low.startsWith("vless://")) {
+            proto = "VLESS";
+            err = ConfigIO.importLink(prefs, proto, t);
+        } else if (low.startsWith("vmess://")) {
+            proto = "VMess";
+            err = ConfigIO.importLink(prefs, proto, t);
+        } else if (t.startsWith("{")) {
+            try {
+                JSONObject root = ConfigIO.parseFile(t.getBytes(java.nio.charset.Charset.forName("UTF-8")));
+                proto = detectProto(root);
+                if (proto == null) {
+                    toast("Import failed: this is not a Nanika configuration");
+                    return;
+                }
+                err = ConfigIO.fromJson(prefs, proto, root, HwId.get(this));
+            } catch (Exception e) {
+                toast("Import failed: " + e.getMessage());
+                return;
+            }
+        } else {
+            toast("Nothing to import: copy a vless:// or vmess:// link or a Nanika config first");
+            return;
+        }
+        if (err != null) {
+            toast("Import failed: " + err);
+            return;
+        }
+        toast(proto + " configuration imported");
+        afterImport(proto, true);
+    }
+
+    // ------------------------------------------------------------------ servers
+
+    private Dialog serverDialog;
+    private LinearLayout serverPinned, serverRows;
+    private ScrollView serverScroll;
+    private TextView serverNote, serverRefreshBtn;
+    private boolean serverFetching;
+    private long serverUpdatedAt;
+    private String serverFailNote = "";
+    private final Runnable serverAutoRefresh = new Runnable() {
+        @Override public void run() {
+            if (serverDialog != null && serverDialog.isShowing()) {
+                fetchServers();
+                ui.postDelayed(this, 30000);
+            }
+        }
+    };
+
+    /** Opens one of our own community links directly (no "are you sure" prompt, unlike links from a server message). */
+    private void openCommunityLink(String url) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addCategory(Intent.CATEGORY_BROWSABLE);
+            startActivity(i);
+        } catch (RuntimeException e) {
+            toast("No app can open this link");
+        }
+    }
+
+    private View socialButton(int res, String description, final String url) {
+        ImageView v = new ImageView(this);
+        v.setImageResource(res);
+        v.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        v.setContentDescription(description);
+        v.setOutlineProvider(new ViewOutlineProvider() {
+            @Override public void getOutline(View view, Outline o) { o.setOval(0, 0, view.getWidth(), view.getHeight()); }
+        });
+        v.setClipToOutline(true);
+        v.setElevation(dp(3));
+        v.setOnClickListener(x -> openCommunityLink(url));
+        pressable(v, 0.9f);
+        return v;
+    }
+
+    /** Downloads the list; the open picker (if any) updates in place, no need to close and reopen it. */
+    private void fetchServers() {
+        if (serverFetching) return;
+        serverFetching = true;
+        serverFailNote = "";
+        updateServerDialog();
+        ServerList.fetch(this, prefs, list -> {
+            serverFetching = false;
+            if (isFinishing()) return;
+            servers = list;
+            serverUpdatedAt = System.currentTimeMillis();
+            reconcileServer(false);
+            refreshServerButton();
+            updateServerDialog();
+        }, () -> {
+            serverFetching = false;
+            serverFailNote = servers == null ? "Could not reach the server list. Connect to the internet."
+                    : "Could not refresh - showing the saved list.";
+            updateServerDialog();
+        });
+    }
+
+    private ServerList.Server findServer(String name) {
+        if (servers == null) return null;
+        for (ServerList.Server s : servers) if (s.name.equals(name)) return s;
+        return null;
+    }
+
+    private String chosenServerName() {
+        return prefs.getString("server_selected", "");
+    }
+
+    /** The chosen server's value for a setting (server address, SSH user / password, UUID), else the user's own. */
+    private String eff(String proto, String key, String def) {
+        String name = chosenServerName();
+        if (!name.isEmpty()) {
+            ServerList.Server s = findServer(name);
+            if (s != null) {
+                String v = s.config(proto).get(key);
+                if (v != null && !v.isEmpty()) return v;
+            }
+        }
+        return p(proto, key, def);
+    }
+
+    private void clearServerSelection() {
+        prefs.edit().remove("server_selected").apply();
+        refreshServerButton();
+    }
+
+    private void refreshServerButton() {
+        if (serverBtn == null) return;
+        String n = chosenServerName();
+        serverBtn.setText(n.isEmpty() ? "Choose server  \u25BE" : "Server: " + n + "  \u25BE");
+    }
+
+    /** Keeps the chosen server consistent with the selected protocol and the latest list. */
+    private void reconcileServer(boolean announce) {
+        String name = chosenServerName();
+        if (name.isEmpty() || servers == null) return;
+        ServerList.Server s = findServer(name);
+        if (s == null) {
+            clearServerSelection();
+            if (announce) toast("\"" + name + "\" is no longer in the list - no server chosen");
+        } else if (!s.supports(protocol)) {
+            clearServerSelection();
+            if (announce) toast(s.name + " does not support " + ServerList.label(protocol) + " - no server chosen");
+        }
+    }
+
+    private void chooseServer(ServerList.Server s) {
+        if (!s.supports(protocol)) {
+            clearServerSelection();
+            toast(s.name + " does not support " + ServerList.label(protocol) + " - no server chosen");
+            return;
+        }
+        prefs.edit().putString("server_selected", s.name).apply();
+        refreshServerButton();
+        toast(busy() ? s.name + " chosen - reconnect to use it" : "Server: " + s.name);
+    }
+
+    private LinearLayout serverRow(String name, String sub, boolean selected, boolean dim, View.OnClickListener click) {
+        LinearLayout r = row();
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(dp(14), dp(8), dp(14), dp(8));
+        r.setMinimumHeight(dp(60));
+        r.setBackground(rippled(selected ? shape(SOFT, 0, 0, 10) : null, 10));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(text(name, 15, selected ? ORANGE : TEXT, true));
+        col.addView(text(sub, 11, MUTED, false));
+        r.addView(col, new LinearLayout.LayoutParams(0, -2, 1));
+        if (selected) r.addView(icon(R.drawable.ic_check, 20, ORANGE));
+        if (dim) r.setAlpha(0.5f);
+        r.setOnClickListener(click);
+        return r;
+    }
+
+    /** Redraws the open picker from the current state (list, saved/failed/refreshing notes). */
+    private void updateServerDialog() {
+        if (serverDialog == null || !serverDialog.isShowing() || serverRows == null) return;
+        serverRefreshBtn.setText(serverFetching ? "REFRESHING..." : "REFRESH");
+        serverRefreshBtn.setAlpha(serverFetching ? 0.5f : 1f);
+
+        String note;
+        int color = MUTED;
+        if (servers == null) {
+            note = !serverFailNote.isEmpty() ? serverFailNote
+                    : serverFetching ? "Getting the server list..." : "No server list yet. Connect to the internet to get the servers.";
+            color = ORANGE;
+        } else if (servers.isEmpty()) {
+            note = "No servers are available right now.";
+        } else if (!serverFailNote.isEmpty()) {
+            note = serverFailNote;
+            color = ORANGE;
+        } else if (serverUpdatedAt > 0) {
+            note = "Updated " + new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date(serverUpdatedAt));
+        } else {
+            note = "Saved list - refreshing...";
+        }
+        serverNote.setText(note);
+        serverNote.setTextColor(color);
+
+        final String cur = chosenServerName();
+        serverPinned.removeAllViews();
+        serverPinned.addView(serverRow("No server", "Use my own configuration", cur.isEmpty(), false, v -> {
+            serverDialog.dismiss();
+            clearServerSelection();
+            toast("No server chosen");
+        }));
+        serverRows.removeAllViews();
+        if (servers != null) {
+            for (final ServerList.Server s : servers) {
+                boolean ok = s.supports(protocol);
+                serverRows.addView(serverRow(s.name, s.protocolSummary() + (ok ? "" : "  -  not on " + ServerList.label(protocol)),
+                        s.name.equals(cur), !ok, v -> {
+                            serverDialog.dismiss();
+                            chooseServer(s);
+                        }));
+            }
+        }
+        // more than four servers: the list shows four and a bit and scrolls
+        ViewGroup.LayoutParams lp = serverScroll.getLayoutParams();
+        lp.height = servers != null && servers.size() > 4 ? dp(4 * 60 + 28) : ViewGroup.LayoutParams.WRAP_CONTENT;
+        serverScroll.setLayoutParams(lp);
+    }
+
+    private void showServerPicker() {
+        if (serverDialog != null && serverDialog.isShowing()) return;
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(shape(CARD, BORDER, 1, 14));
+        box.setPadding(dp(8), dp(16), dp(8), dp(10));
+        TextView t = text("Choose server", 16, TEXT, true);
+        t.setPadding(dp(14), 0, dp(14), dp(2));
+        box.addView(t);
+        TextView sub = text("Protocol: " + ServerList.label(protocol), 12, MUTED, false);
+        sub.setPadding(dp(14), 0, dp(14), dp(2));
+        box.addView(sub);
+        serverNote = text("", 11, MUTED, false);
+        serverNote.setPadding(dp(14), 0, dp(14), dp(8));
+        box.addView(serverNote);
+
+        serverPinned = new LinearLayout(this);
+        serverPinned.setOrientation(LinearLayout.VERTICAL);
+        box.addView(serverPinned);
+
+        serverRows = new LinearLayout(this);
+        serverRows.setOrientation(LinearLayout.VERTICAL);
+        serverScroll = new ScrollView(this);
+        serverScroll.setVerticalScrollBarEnabled(true);
+        serverScroll.addView(serverRows);
+        box.addView(serverScroll, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout foot = row();
+        foot.setGravity(Gravity.END);
+        serverRefreshBtn = text("REFRESH", 12, ORANGE, true);
+        serverRefreshBtn.setPadding(dp(14), dp(12), dp(14), dp(4));
+        serverRefreshBtn.setOnClickListener(v -> fetchServers());
+        TextView cancel = text("CANCEL", 12, ORANGE, true);
+        cancel.setPadding(dp(14), dp(12), dp(14), dp(4));
+        cancel.setOnClickListener(v -> d.dismiss());
+        foot.addView(serverRefreshBtn);
+        foot.addView(cancel);
+        box.addView(foot);
+
+        d.setContentView(box);
+        if (d.getWindow() != null) {
+            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            d.getWindow().setLayout((int) (getResources().getDisplayMetrics().widthPixels * 0.88f),
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        d.setOnDismissListener(x -> {
+            ui.removeCallbacks(serverAutoRefresh);
+            serverDialog = null;
+            serverPinned = null;
+            serverRows = null;
+            serverScroll = null;
+            serverNote = null;
+            serverRefreshBtn = null;
+        });
+        serverDialog = d;
+        d.show();
+        updateServerDialog();
+        fetchServers();                                   // fresh list every time the picker opens ...
+        ui.postDelayed(serverAutoRefresh, 30000);          // ... and again every 30 s while it stays open
+    }
 
     // ================================================================== Sharenet
 
@@ -1612,9 +2065,9 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     private ProtocolConfig sshConfig() {
         final String P = "SSH";
         ProtocolConfig pc = new ProtocolConfig();
-        pc.sshUser = p(P, "user", "").trim();
-        pc.sshPassword = p(P, "pass", "");
-        pc.sshHost = p(P, "sshHost", ConfigIO.DEFAULT_SSH_HOST).trim();   // "Server Address": [host] in the payload
+        pc.sshUser = eff(P, "user", "").trim();
+        pc.sshPassword = eff(P, "pass", "");
+        pc.sshHost = eff(P, "sshHost", ConfigIO.DEFAULT_SSH_HOST).trim();   // "Server Address": [host] in the payload
         pc.sshPort = 22;
         pc.proxyHost = p(P, "proxyHost", "").trim();
         pc.tls = tlsOn(P);
@@ -1631,13 +2084,13 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
                 return ProtocolRegistry.require("SSH").validate(sshConfig());
             }
             ProtocolConfig pc = new ProtocolConfig();
-            pc.uuid = p(protocol, "uuid", "");
+            pc.uuid = eff(protocol, "uuid", "");
             String err = ProtocolRegistry.require(protocol).validate(pc);
             if (err != null) return err;
             int port = intOr(p(protocol, "port", "443"), -1);
             if (port < 1 || port > 65535) return "Port must be 1-65535";
             if (tlsOn(protocol) && p(protocol, "sni", "").trim().isEmpty()) return "SNI host is empty";
-            if (p(protocol, "server", "").trim().isEmpty()) return "Host header is empty";
+            if (eff(protocol, "server", "").trim().isEmpty()) return "Host header is empty";
             if (p(protocol, "connectIp", "").trim().isEmpty()) return "Connect IP is empty";
             return null;
         } catch (java.io.IOException e) {
@@ -1665,8 +2118,8 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             intent.putExtra("proxyPort", s.proxyPort);
             intent.putExtra("wsFrames", prefs.getBoolean("SSH_wsFrames", false));
         } else {
-            intent.putExtra("uuid", p(protocol, "uuid", "").trim());
-            intent.putExtra("server", p(protocol, "server", "").trim());
+            intent.putExtra("uuid", eff(protocol, "uuid", "").trim());
+            intent.putExtra("server", eff(protocol, "server", "").trim());
             intent.putExtra("connectIp", p(protocol, "connectIp", "").trim());
             intent.putExtra("port", intOr(p(protocol, "port", "443"), 443));
             intent.putExtra("bug", p(protocol, "sni", "").trim());
@@ -1933,6 +2386,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
         SharedPreferences.Editor e = prefs.edit();
         for (String k : ConfigIO.keys(P)) e.remove(P + "_" + k);
         e.apply();
+        clearServerSelection();
         toast(P + " configuration reset");
         if (page.equals(P.toLowerCase(Locale.US))) show(P.toLowerCase(Locale.US));
     }
@@ -2035,7 +2489,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             return;
         }
         toast(proto + " configuration imported");
-        show(proto.toLowerCase(Locale.US));
+        afterImport(proto, false);
     }
 
     private void exportLink(String proto) {
@@ -2455,6 +2909,7 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
     }
 
     private void pickImportFile(String proto) {
+        // AUTO is used by the Home IMPORT button so .anika/.json files can declare their own protocol.
         pendingImportProto = proto;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -2468,20 +2923,35 @@ public class MainActivity extends AppCompatActivity implements TunnelState.Liste
             ByteArrayOutputStream bo = new ByteArrayOutputStream();
             byte[] buf = new byte[8192];
             int n;
-            while ((n = in.read(buf)) > 0) {
+            while ((n = in.read(buf)) != -1) {
+                if (n == 0) continue;
                 bo.write(buf, 0, n);
                 if (bo.size() > 1024 * 1024) throw new java.io.IOException("the file is too large");
             }
             JSONObject root = ConfigIO.parseFile(bo.toByteArray());
+            boolean auto = "AUTO".equals(proto);
+            if (auto) {
+                proto = detectProto(root);
+                if (proto == null) {
+                    toast("Import failed: this is not a Nanika configuration");
+                    return;
+                }
+            }
             String err = ConfigIO.fromJson(prefs, proto, root, HwId.get(this));
             if (err != null) {
                 toast("Import failed: " + err);
                 return;
             }
             toast(proto + " configuration imported");
-            show(proto.toLowerCase(Locale.US));
+            afterImport(proto, auto);
+        } catch (SecurityException e) {
+            Log.w("Nanika", "No permission to read " + uri, e);
+            toast("Import failed: Android did not allow Nanika to read this file. "
+                    + "Open it again, or use IMPORT inside Nanika.");
         } catch (Exception e) {
-            toast("Import failed: " + e.getMessage());
+            Log.w("Nanika", "Import failed for " + uri, e);
+            String m = e.getMessage();
+            toast("Import failed: " + (m == null || m.isEmpty() ? e.getClass().getSimpleName() : m));
         }
     }
 
