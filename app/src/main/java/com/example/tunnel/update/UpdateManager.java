@@ -26,11 +26,11 @@ public final class UpdateManager {
     private UpdateManager() {}
 
     /** EDIT THESE TWO: the GitHub account and the (public) repository that holds your releases. */
-    public static final String GITHUB_OWNER = "YOUR_GITHUB_USERNAME";
-    public static final String GITHUB_REPO = "nanika-releases";
+    public static final String GITHUB_OWNER = "Andreaz254";
+    public static final String GITHUB_REPO = "nanika";
 
     public static final String CHECK_URL =
-            "https://api.github.com/repos/" + Andreaz254 + "/" + nanika + "/releases/latest";
+            "https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO + "/releases/latest";
     private static final int TIMEOUT_MS = 8000;
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
@@ -65,13 +65,8 @@ public final class UpdateManager {
                 l.onNoUpdate();
                 return;
             }
-            String version = j.optString("tag_name", "").trim().replaceFirst("^[vV]", "");
             JSONArray assets = j.optJSONArray("assets");
-            if (version.isEmpty() || assets == null) {
-                l.onNoUpdate();
-                return;
-            }
-            if (compare(version, currentVersion) <= 0) {
+            if (assets == null) {
                 l.onNoUpdate();
                 return;
             }
@@ -84,6 +79,19 @@ public final class UpdateManager {
                 }
             }
             if (apk == null) {
+                l.onNoUpdate();
+                return;
+            }
+            // Version: from the tag ("v1.8"); if the tag has no number (e.g. a descriptive tag name),
+            // from the APK file name ("nanika-v1.8.apk"), then from the release title.
+            String version = extractVersion(j.optString("tag_name", ""));
+            if (version == null) version = extractVersion(apk.optString("name", ""));
+            if (version == null) version = extractVersion(j.optString("name", ""));
+            if (version == null) {
+                l.onNoUpdate();
+                return;
+            }
+            if (compare(version, currentVersion) <= 0) {
                 l.onNoUpdate();
                 return;
             }
@@ -101,6 +109,13 @@ public final class UpdateManager {
         } catch (Exception e) {
             l.onNoUpdate();                          // offline, rate-limited, bad JSON, ... -> ignore silently
         }
+    }
+
+    /** First dotted number in {@code s} ("v1.8" -> "1.8", "nanika-v1.17.apk" -> "1.17"), or null. */
+    static String extractVersion(String s) {
+        if (s == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\d+(?:\\.\\d+)*").matcher(s);
+        return m.find() ? m.group() : null;
     }
 
     /** Positive if {@code a} is newer than {@code b}, comparing dot-separated numeric parts ("1.9" < "1.17"). */
